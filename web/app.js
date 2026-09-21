@@ -1,0 +1,1161 @@
+/**
+ * MiniAgent Web UI v2.1 - 前端逻辑
+ *
+ * 新增：
+ * - 项目选择与管理
+ * - 任务列表：新建/切换/重命名/删除（左栏）
+ * - 任务历史：切换任务自动恢复对话
+ * - 技能激活（带参数）/ 自定义技能
+ * - MCP 服务器管理（添加/连接/断开/删除）
+ */
+
+const API = ''
+let isLoading = false
+let editingModelId = null
+let currentProjectId = null
+let currentTaskId = null
+let _thinkBubble = null  // 当前流式"思考气泡"元素
+
+const $ = (sel) => document.querySelector(sel)
+const chatMessages = $('#chatMessages')
+const chatInput = $('#chatInput')
+const btnSend = $('#btnSend')
+const btnReset = $('#btnReset')
+const statusIndicator = $('#statusIndicator')
+const statusText = $('#statusText')
+const executionLog = $('#executionLog')
+const toolsList = $('#toolsList')
+const tokenStat = $('#tokenStat')
+
+// ── 初始化 ────────────────────────────────────────────────
+
+async function init() {
+  await loadStatus()
+  setupEventListeners()
+  setupWebSocket()
+}
+
+async function loadStatus() {
+  try {
+    const res = await fetch(`${API}/api/status`)
+    const data = await res.json()
+    renderTools(data.tools)
+
+    // 项目
+    if (data.projects && data.projects.length > 0) {
+      if (!currentProjectId || !data.projects.find(p => p.id === currentProjectId)) {
+        // 优先选激活任务所在项目，否则第一个
+        const activeTask = data.projects.find(p => p.taskCount > 0) || data.projects[0]
+        currentProjectId = activeTask.id
+      }
+      renderProjectName(data.projects)
+      await loadTasks()
+    }
+
+    // 激活任务
+    if (data.activeTaskId && data.activeTaskId !== currentTaskId) {
+      await switchTask(data.activeTaskId, { silent: true })
+    }
+  } catch (err) {
+    console.error('Failed to load status:', err)
+  }
+}
+
+function renderTools(tools) {
+  toolsList.innerHTML = tools.map(t =>
+    `<div class="tool-item">${t.mcp ? '🔌' : '🔧'} <span class="name">${t.name}</span> - ${t.description}</div>`
+  ).join('')
+}
+
+// ── 项目 ──────────────────────────────────────────────────
+
+function renderProjectName(projects) {
+  const p = projects.find(p => p.id === currentProjectId)
+  $('#currentProjectName').textContent = p ? p.name : '未选择'
+}
+
+async function loadProjectsList() {
+  const res = await fetch(`${API}/api/projects`)
+  const projects = await res.json()
+  renderProjectName(projects)
+  $('#projectsList').innerHTML = projects.map(p => `
+    <div class="model-card ${p.id === currentProjectId ? 'active' : ''}">
+      <div class="model-card-info">
+        <h5>${p.id === currentProjectId ? '✅ ' : ''}${escapeHtml(p.name)}</h5>
+        <div class="meta">📁 ${escapeHtml(p.dir)} · ${p.taskCount} 个任务</div>
+      </div>
+      <div class="model-card-actions">
+        ${p.id !== currentProjectId ? `<button class="btn-activate" onclick="selectProject('${p.id}')">切换</button>` : ''}
+        ${p.id !== 'default' ? `<button onclick="deleteProject('${p.id}')">删除</button>` : ''}
+      </div>
+    </div>
+  `).join('') || '<div class="log-empty">暂无项目</div>'
+}
+
+async function selectProject(id) {
+  currentProjectId = id
+  currentTaskId = null
+  await loadTasks()
+  await loadProjectsList()
+  await loadStatus()
+  renderChatTitle()
+}
+
+async function createProject() {
+  const name = $('#pName').value.trim()
+  const dir = $('#pDir').value.trim() || '.'
+  if (!name) return alert('请输入项目名称')
+  const res = await fetch(`${API}/api/projects`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, dir }),
+  })
+  const data = await res.json()
+  if (data.error) return alert(`创建失败: ${data.error}`)
+  $('#pName').value = ''
+  currentProjectId = data.project.id
+  await loadProjectsList()
+  await loadTasks()
+  renderChatTitle()
+}
+
+async function deleteProject(id) {
+  if (!confirm('删除项目将同时删除其下所有任务与历史，确定？')) return
+  await fetch(`${API}/api/projects/${id}`, { method: 'DELETE' })
+  if (currentProjectId === id) {
+    currentProjectId = null
+    currentTaskId = null
+  }
+  await loadProjectsList()
+  await loadTasks()
+  await loadStatus()
+}
+
+// ── 任务 ──────────────────────────────────────────────────
+
+async function loadTasks() {
+  if (!currentProjectId) {
+    $('#taskList').innerHTML = '<div class="task-empty">请先选择项目</div>'
+    $('#taskCount').textContent = '0'
+    return
+  }
+  const res = await fetch(`${API}/api/projects/${currentProjectId}/tasks`)
+  const tasks = await res.json()
+  $('#taskCount').textContent = tasks.length
+  $('#taskList').innerHTML = tasks.map(t => `
+    <div class="task-item ${t.id === currentTaskId ? 'active' : ''}" onclick="switchTask('${t.id}')" title="${escapeHtml(t.title)}">
+      <div class="task-item-title">${t.id === currentTaskId ? '● ' : ''}${escapeHtml(t.title)}</div>
+      <div class="task-item-meta">${t.messageCount} 条消息 · ${formatTime(t.updatedAt)}</div>
+      <div class="task-item-actions">
+        <button onclick="event.stopPropagation();renameTask('${t.id}', '${escapeHtml(t.title).replace(/'/g, '&#39;')}')" title="重命名">✏️</button>
+        <button onclick="event.stopPropagation();deleteTask('${t.id}')" title="删除">🗑</button>
+      </div>
+    </div>
+  `).join('') || '<div class="task-empty">暂无任务，点击上方新建</div>'
+}
+
+function createNewTask() {
+  $('#taskTitle').value = ''
+  $('#taskModal').classList.remove('hidden')
+  setTimeout(() => $('#taskTitle').focus(), 50)
+}
+
+async function confirmCreateTask() {
+  const title = $('#taskTitle').value.trim() || `任务 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`
+  if (!currentProjectId) return alert('请先在项目中选择或创建一个项目')
+  const res = await fetch(`${API}/api/projects/${currentProjectId}/tasks`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  })
+  const data = await res.json()
+  if (data.error) return alert(`创建失败: ${data.error}`)
+  closeModal('taskModal')
+  currentTaskId = data.task.id
+  renderChatWelcome(title)
+  await loadTasks()
+  renderChatTitle()
+}
+
+async function switchTask(taskId, { silent } = {}) {
+  const res = await fetch(`${API}/api/tasks/${taskId}/activate`, { method: 'POST' })
+  const data = await res.json()
+  if (data.error) return
+  currentTaskId = taskId
+  // 找到所属项目并切换
+  const tres = await fetch(`${API}/api/tasks/${taskId}`)
+  const tdata = await tres.json()
+  if (tdata.project && tdata.project.id !== currentProjectId) {
+    currentProjectId = tdata.project.id
+    await loadTasks()
+  }
+  renderHistory(data.messages || [])
+  renderChatTitle()
+  executionLog.innerHTML = '<div class="log-empty">已切换任务</div>'
+  hidePlan()
+  if (!silent) await loadTasks()
+}
+
+function renderHistory(messages) {
+  chatMessages.innerHTML = ''
+  window._thinkHadBubble = false
+  window._lastThinkBubble = null
+  _thinkBubble = null
+  let hasContent = false
+  for (const msg of messages) {
+    if (msg.role === 'user') {
+      appendMessage('user', msg.content)
+      hasContent = true
+    } else if (msg.role === 'assistant' && msg.content) {
+      appendMessage('assistant', msg.content)
+      hasContent = true
+    } else if (msg.role === 'assistant' && msg.tool_calls) {
+      for (const tc of msg.tool_calls) {
+        appendToolCall(tc.function.name, JSON.parse(tc.function.arguments || '{}'))
+        hasContent = true
+      }
+    } else if (msg.role === 'tool') {
+      appendToolResult(msg.tool_call_id, msg.content)
+      hasContent = true
+    }
+  }
+  if (!hasContent) {
+    renderChatWelcome()
+  }
+}
+
+async function renameTask(taskId, currentTitle) {
+  const newTitle = prompt('新的任务标题：', currentTitle)
+  if (!newTitle || newTitle === currentTitle) return
+  await fetch(`${API}/api/tasks/${taskId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: newTitle }),
+  })
+  await loadTasks()
+  if (taskId === currentTaskId) renderChatTitle()
+}
+
+async function deleteTask(taskId) {
+  if (!confirm('删除该任务及其全部历史，确定？')) return
+  await fetch(`${API}/api/tasks/${taskId}`, { method: 'DELETE' })
+  if (taskId === currentTaskId) {
+    currentTaskId = null
+    renderChatWelcome()
+    renderChatTitle()
+  }
+  await loadTasks()
+}
+
+function renderChatTitle() {
+  const titleEl = $('#chatTitle')
+  if (currentTaskId) {
+    titleEl.textContent = '对话'
+    titleEl.dataset.taskTitle = ''
+  } else {
+    titleEl.textContent = '未选择任务'
+  }
+}
+
+function renderChatWelcome(title) {
+  chatMessages.innerHTML = `
+    <div class="welcome">
+      <h3>${title ? '✨ ' + escapeHtml(title) : '👋 你好！我是 MiniAgent'}</h3>
+      <p>${title ? '新任务已创建，开始对话吧' : '一个专为小模型设计的办公助手。'}</p>
+      <ul>
+        <li>📁 整理文件和文件夹</li>
+        <li>📄 读写 CSV、JSON 文件</li>
+        <li>📝 批量处理文本</li>
+        <li>📊 生成简单报告</li>
+      </ul>
+    </div>
+  `
+}
+
+// ── 技能 ──────────────────────────────────────────────────
+
+async function openSkillsModal() {
+  $('#skillsModal').classList.remove('hidden')
+  await loadSkillsFullList()
+}
+
+async function loadSkillsFullList() {
+  const res = await fetch(`${API}/api/skills`)
+  const skills = await res.json()
+  $('#skillsFullList').innerHTML = skills.map(s => `
+    <div class="model-card ${s.active ? 'active' : ''}">
+      <div class="model-card-info">
+        <h5>${s.active ? '✅ ' : '⚡ '}${escapeHtml(s.description)}</h5>
+        <div class="meta">${escapeHtml(s.name)}${s.steps?.length ? ' · 工具链: ' + s.steps.join('→') : ''}${s.builtin ? ' · 内置' : ' · 自定义'}</div>
+      </div>
+      <div class="model-card-actions">
+        ${s.active
+          ? `<button onclick="deactivateSkill('${s.name}')">停用</button>`
+          : `<button class="btn-activate" onclick="activateSkill('${s.name}')">激活</button>`}
+        ${!s.builtin ? `<button onclick="deleteSkill('${s.name}')">删除</button>` : ''}
+      </div>
+    </div>
+  `).join('')
+}
+
+async function activateSkill(name) {
+  // 获取技能参数定义
+  const res = await fetch(`${API}/api/skills`)
+  const skills = await res.json()
+  const skill = skills.find(s => s.name === name)
+  const params = {}
+  if (skill?.params?.length) {
+    for (const p of skill.params) {
+      if (!p.default) {
+        const v = prompt(`${p.label || p.key}：`, '')
+        if (v === null) return // 取消
+        params[p.key] = v
+      }
+    }
+  }
+  const ares = await fetch(`${API}/api/skills/${name}/activate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  })
+  const data = await ares.json()
+  if (data.error) return alert(`激活失败: ${data.error}`)
+  await loadSkillsFullList()
+}
+
+async function deactivateSkill(name) {
+  await fetch(`${API}/api/skills/${name}/deactivate`, { method: 'POST' })
+  await loadSkillsFullList()
+}
+
+async function createCustomSkill() {
+  const name = $('#skName').value.trim()
+  const description = $('#skDesc').value.trim()
+  const instruction = $('#skInstruction').value.trim()
+  if (!name || !instruction) return alert('技能名称和指令必填')
+  const res = await fetch(`${API}/api/skills`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, description, instruction }),
+  })
+  const data = await res.json()
+  if (data.error) return alert(`创建失败: ${data.error}`)
+  $('#skName').value = ''
+  $('#skDesc').value = ''
+  $('#skInstruction').value = ''
+  await loadSkillsFullList()
+}
+
+async function deleteSkill(name) {
+  if (!confirm(`删除自定义技能 ${name}？`)) return
+  await fetch(`${API}/api/skills/${name}`, { method: 'DELETE' })
+  await loadSkillsFullList()
+}
+
+// ── MCP ───────────────────────────────────────────────────
+
+async function openMcpModal() {
+  $('#mcpModal').classList.remove('hidden')
+  await loadMcpServers()
+}
+
+async function loadMcpServers() {
+  const res = await fetch(`${API}/api/mcp`)
+  const servers = await res.json()
+  $('#mcpServersList').innerHTML = servers.map(s => `
+    <div class="model-card">
+      <div class="model-card-info">
+        <h5>${s.connected ? '🟢' : '⚪'} ${escapeHtml(s.name)}</h5>
+        <div class="meta">${escapeHtml(s.type)} · ${s.tools.length} 个工具${s.error ? ' · ' + escapeHtml(s.error) : ''}</div>
+      </div>
+      <div class="model-card-actions">
+        ${s.connected
+          ? `<button onclick="disconnectMcp('${s.name}')">断开</button>`
+          : `<button class="btn-activate" onclick="connectMcp('${s.name}')">连接</button>`}
+        <button onclick="deleteMcpServer('${s.name}')">删除</button>
+      </div>
+    </div>
+  `).join('') || '<div class="log-empty">暂未配置 MCP 服务器</div>'
+}
+
+function onMcpTypeChange() {
+  const type = $('#mcpType').value
+  $('#mcpStdioRow').classList.toggle('hidden', type !== 'stdio')
+  $('#mcpHttpRow').classList.toggle('hidden', type === 'stdio')
+}
+
+async function addMcpServer() {
+  const name = $('#mcpName').value.trim()
+  const type = $('#mcpType').value
+  if (!name) return alert('请填写服务器名称')
+  const body = { name, type }
+  if (type === 'stdio') {
+    body.command = $('#mcpCommand').value.trim()
+    body.args = $('#mcpArgs').value.trim().split(/\s+/).filter(Boolean)
+    if (!body.command) return alert('请填写命令')
+  } else {
+    body.url = $('#mcpUrl').value.trim()
+    if (!body.url) return alert('请填写 URL')
+  }
+  const res = await fetch(`${API}/api/mcp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const data = await res.json()
+  if (data.error) return alert(`添加失败: ${data.error}`)
+  $('#mcpName').value = ''
+  await loadMcpServers()
+}
+
+async function connectMcp(name) {
+  const res = await fetch(`${API}/api/mcp/${name}/connect`, { method: 'POST' })
+  const data = await res.json()
+  if (data.error) return alert(`连接失败: ${data.error}`)
+  await loadMcpServers()
+  await loadStatus()
+}
+
+async function connectAllMcp() {
+  await fetch(`${API}/api/mcp/connect-all`, { method: 'POST' })
+  await loadMcpServers()
+  await loadStatus()
+}
+
+async function disconnectMcp(name) {
+  await fetch(`${API}/api/mcp/${name}/disconnect`, { method: 'POST' })
+  await loadMcpServers()
+  await loadStatus()
+}
+
+async function deleteMcpServer(name) {
+  if (!confirm(`删除 MCP 服务器 ${name}？`)) return
+  await fetch(`${API}/api/mcp/${name}`, { method: 'DELETE' })
+  await loadMcpServers()
+  await loadStatus()
+}
+
+// ── 模型管理 ──────────────────────────────────────────────
+
+async function openModelsModal() {
+  $('#modelsModal').classList.remove('hidden')
+  await loadModelsList()
+  resetForm()
+}
+
+function closeModelsModal() {
+  $('#modelsModal').classList.add('hidden')
+}
+
+function closeModal(id) {
+  $('#' + id).classList.add('hidden')
+}
+
+async function loadModelsList() {
+  try {
+    const res = await fetch(`${API}/api/models`)
+    const models = await res.json()
+    $('#modelsList').innerHTML = models.map(m => `
+      <div class="model-card ${m.isActive ? 'active' : ''}">
+        <div class="model-card-info">
+          <h5>${m.isActive ? '✅ ' : ''}${escapeHtml(m.name)}</h5>
+          <div class="meta">${escapeHtml(m.provider)} · ${escapeHtml(m.model)} · ${escapeHtml((m.baseURL || '').slice(0, 40))}</div>
+        </div>
+        <div class="model-card-actions">
+          ${!m.isActive ? `<button class="btn-activate" onclick="activateModel('${m.id}')">启用</button>` : ''}
+          <button onclick="editModel('${m.id}')">编辑</button>
+          <button onclick="deleteModel('${m.id}')">删除</button>
+        </div>
+      </div>
+    `).join('') || '<div class="log-empty">暂无配置的模型</div>'
+  } catch (err) {
+    console.error('Failed to load models:', err)
+  }
+}
+
+function onProviderChange() {
+  const provider = $('#mProvider').value
+  const templates = {
+    ollama: { baseURL: 'http://localhost:11434/v1', model: 'qwen3:4b', apiKey: '***' },
+    deepseek: { baseURL: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+    qwen: { baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-turbo' },
+    moonshot: { baseURL: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k' },
+    zhipu: { baseURL: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4-flash' },
+    openai: { baseURL: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+    custom: { baseURL: '', model: '' },
+  }
+  const t = templates[provider] || templates.custom
+  if (!$('#mName').value || editingModelId === null) {
+    $('#mBaseURL').value = t.baseURL || ''
+    $('#mModel').value = t.model || ''
+    if (t.apiKey) $('#mApiKey').value = t.apiKey
+  }
+}
+
+async function saveModel() {
+  const data = {
+    name: $('#mName').value || '未命名',
+    provider: $('#mProvider').value,
+    baseURL: $('#mBaseURL').value,
+    apiKey: $('#mApiKey').value,
+    model: $('#mModel').value,
+    maxTokens: parseInt($('#mMaxTokens').value) || 2048,
+    contextLength: parseInt($('#mContextLength').value) || 32768,
+    temperature: parseFloat($('#mTemperature').value) || 0.3,
+  }
+
+  if (!data.baseURL || !data.model) {
+    showTestResult('error', '请填写 API 地址和模型 ID')
+    return
+  }
+
+  try {
+    if (editingModelId) {
+      await fetch(`${API}/api/models/${editingModelId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      })
+    } else {
+      await fetch(`${API}/api/models`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      })
+    }
+    resetForm()
+    await loadModelsList()
+    await loadStatus()
+    showTestResult('success', '保存成功')
+  } catch (err) {
+    showTestResult('error', `保存失败: ${err.message}`)
+  }
+}
+
+function editModel(id) {
+  fetch(`${API}/api/models`)
+    .then(r => r.json())
+    .then(models => {
+      const m = models.find(m => m.id === id)
+      if (!m) return
+      editingModelId = id
+      $('#modelFormTitle').textContent = '编辑模型'
+      $('#mName').value = m.name || ''
+      $('#mProvider').value = m.provider || 'custom'
+      $('#mBaseURL').value = m.baseURL || ''
+      $('#mApiKey').value = ''
+      $('#mModel').value = m.model || ''
+      $('#mMaxTokens').value = m.maxTokens || 2048
+      $('#mContextLength').value = m.contextLength || 32768
+      $('#mTemperature').value = m.temperature || 0.3
+    })
+}
+
+async function deleteModel(id) {
+  if (!confirm('确定删除这个模型配置？')) return
+  await fetch(`${API}/api/models/${id}`, { method: 'DELETE' })
+  await loadModelsList()
+  await loadStatus()
+}
+
+async function activateModel(id) {
+  await fetch(`${API}/api/models/${id}/activate`, { method: 'POST' })
+  await loadModelsList()
+  await loadStatus()
+}
+
+async function testModel() {
+  const data = {
+    baseURL: $('#mBaseURL').value,
+    model: $('#mModel').value,
+    apiKey: $('#mApiKey').value,
+  }
+  showTestResult('', '测试中...')
+  try {
+    const res = await fetch(`${API}/api/models/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    })
+    const result = await res.json()
+    if (result.success) {
+      showTestResult('success', `连接成功！回复: ${result.reply}`)
+    } else {
+      showTestResult('error', `连接失败: ${result.error}`)
+    }
+  } catch (err) {
+    showTestResult('error', `请求失败: ${err.message}`)
+  }
+}
+
+async function fetchModels() {
+  const baseURL = $('#mBaseURL').value
+  const apiKey = $('#mApiKey').value
+  if (!baseURL) {
+    showTestResult('error', '请先填写 API 地址')
+    return
+  }
+  showTestResult('', '获取模型列表中...')
+  try {
+    const res = await fetch(`${API}/api/models/fetch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baseURL, apiKey }),
+    })
+    const result = await res.json()
+    if (result.success && result.models.length > 0) {
+      const select = $('#mModelSelect')
+      select.innerHTML = '<option value="">-- 选择模型 (' + result.models.length + ' 个) --</option>'
+      for (const m of result.models) {
+        select.innerHTML += `<option value="${m.id}">${m.name}</option>`
+      }
+      select.classList.remove('hidden')
+      showTestResult('success', `获取到 ${result.models.length} 个模型`)
+    } else {
+      showTestResult('error', result.error || '未获取到模型')
+      $('#mModelSelect').classList.add('hidden')
+    }
+  } catch (err) {
+    showTestResult('error', `获取失败: ${err.message}`)
+  }
+}
+
+function onModelSelect() {
+  const select = $('#mModelSelect')
+  if (select.value) {
+    $('#mModel').value = select.value
+  }
+}
+
+function showTestResult(type, msg) {
+  const el = $('#testResult')
+  el.className = `test-result ${type}`
+  el.textContent = msg
+  el.classList.remove('hidden')
+}
+
+function resetForm() {
+  editingModelId = null
+  $('#modelFormTitle').textContent = '添加新模型'
+  $('#mName').value = ''
+  $('#mProvider').value = 'ollama'
+  $('#mBaseURL').value = 'http://localhost:11434/v1'
+  $('#mApiKey').value = ''
+  $('#mModel').value = ''
+  $('#mMaxTokens').value = 2048
+  $('#mContextLength').value = 32768
+  $('#mTemperature').value = 0.3
+  $('#testResult').classList.add('hidden')
+}
+
+// ── 对话 ──────────────────────────────────────────────────
+
+async function sendMessage() {
+  const message = chatInput.value.trim()
+  if (!message || isLoading) return
+
+  // 无任务时自动新建
+  if (!currentTaskId) {
+    if (!currentProjectId) {
+      return appendMessage('system', '请先在左栏选择或创建项目')
+    }
+    const res = await fetch(`${API}/api/projects/${currentProjectId}/tasks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: message.slice(0, 30) }),
+    })
+    const data = await res.json()
+    if (data.error) return appendMessage('system', `创建任务失败: ${data.error}`)
+    currentTaskId = data.task.id
+    renderChatTitle()
+    await loadTasks()
+    renderChatWelcome(data.task.title)
+  }
+
+  appendMessage('user', message)
+  chatInput.value = ''
+  setLoading(true)
+  hidePlan()
+  window._live = { gotTool: false, gotResponse: false }
+  window._thinkHadBubble = false
+  window._lastThinkBubble = null
+  _thinkBubble = null
+  showThinking('● 思考中…')
+
+  try {
+    const res = await fetch(`${API}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, taskId: currentTaskId }),
+    })
+    const data = await res.json()
+
+    if (data.error) {
+      appendMessage('system', `错误: ${data.error}`)
+    } else {
+      // 优先采用 WebSocket 实时流；仅在未收到流事件时回退到请求载荷，避免重复渲染
+      if (!window._live.gotTool && data.steps) {
+        for (const step of data.steps) {
+          appendToolCall(step.tool, step.args)
+          appendToolResult(step.tool, step.result)
+        }
+      }
+      if (!window._live.gotResponse && data.text) appendMessage('assistant', data.text)
+    }
+  } catch (err) {
+    appendMessage('system', `请求失败: ${err.message}`)
+  } finally {
+    setLoading(false)
+    hideThinking()
+    await loadTasks() // 刷新任务列表的消息数
+  }
+}
+
+// ── UI 工具 ───────────────────────────────────────────────
+
+function appendMessage(role, content) {
+  const div = document.createElement('div')
+  div.className = `message ${role}`
+  if (role === 'assistant') {
+    const md = document.createElement('div')
+    md.className = 'md-content'
+    md.innerHTML = renderMarkdown(content)
+    div.appendChild(md)
+  } else {
+    div.textContent = content
+  }
+  chatMessages.appendChild(div)
+  chatMessages.scrollTop = chatMessages.scrollHeight
+}
+
+function appendToolCall(name, args) {
+  const wrap = document.createElement('div')
+  wrap.className = 'message tool-call'
+  const argsStr = (args && Object.keys(args).length) ? JSON.stringify(args) : '（无参数）'
+  wrap.innerHTML = `
+    <div class="tool-call-head">
+      <span class="tool-icon">🔧</span>
+      <span class="tool-name">${escapeHtml(name)}</span>
+      <span class="tool-state calling">调用中…</span>
+    </div>
+    <div class="tool-args"><code>${escapeHtml(argsStr).slice(0, 400)}</code></div>`
+  chatMessages.appendChild(wrap)
+  chatMessages.scrollTop = chatMessages.scrollHeight
+  addLogEntry(name, 'calling')
+}
+
+function appendToolResult(name, result) {
+  const wrap = document.createElement('div')
+  wrap.className = 'message tool-result'
+  const text = typeof result === 'string' ? result : JSON.stringify(result)
+  const isErr = !!(result && result.error) || /"error"/.test(text) || text.startsWith('错误')
+  wrap.innerHTML = `
+    <div class="tool-call-head">
+      <span class="tool-icon">${isErr ? '⚠️' : '✅'}</span>
+      <span class="tool-name">${escapeHtml(name)}</span>
+      <span class="tool-state ${isErr ? 'error' : 'success'}">${isErr ? '失败' : '完成'}</span>
+    </div>
+    <div class="tool-args"><code>${escapeHtml(text).slice(0, 400)}</code></div>`
+  chatMessages.appendChild(wrap)
+  chatMessages.scrollTop = chatMessages.scrollHeight
+  addLogEntry(name, isErr ? 'error' : 'success')
+}
+
+function addLogEntry(name, status) {
+  if (executionLog.querySelector('.log-empty')) executionLog.innerHTML = ''
+  const div = document.createElement('div')
+  div.className = 'log-entry'
+  div.innerHTML = `<span class="tool-name">${escapeHtml(name)}</span><span class="tool-status ${status === 'success' ? 'success' : ''}">${status === 'success' ? '✓' : '...'}</span>`
+  executionLog.appendChild(div)
+  executionLog.scrollTop = executionLog.scrollHeight
+}
+
+function setLoading(loading) {
+  isLoading = loading
+  btnSend.disabled = loading
+  chatInput.disabled = loading
+  statusIndicator.className = `status-dot ${loading ? 'thinking' : 'idle'}`
+  statusText.textContent = loading ? '思考中...' : '就绪'
+}
+
+function formatTime(iso) {
+  if (!iso) return ''
+  const d = new Date(iso)
+  const now = new Date()
+  if (d.toDateString() === now.toDateString()) {
+    return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+  }
+  return d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
+}
+
+function escapeHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+// ── Markdown 渲染（对话框格式美化，离线无依赖）─────────────
+
+function isHashCommentLang(lang) {
+  return /^(py|python|sh|bash|shell|zsh|yml|yaml|rb|ruby|toml|ini|cfg|conf|dockerfile|make|makefile|gradle|r|jl|julia|pl|perl|php|sql)$/i.test(lang || '')
+}
+
+// 轻量语法高亮：注释 / 字符串 / 数字 / 关键字。先整体转义，按匹配片段包裹 span，避免嵌套出错。
+function highlightCode(raw, lang) {
+  const KEYWORDS = new Set(['const', 'let', 'var', 'function', 'return', 'if', 'else', 'for', 'while', 'do', 'class', 'def', 'import', 'from', 'include', 'int', 'void', 'public', 'private', 'protected', 'struct', 'enum', 'true', 'false', 'null', 'None', 'True', 'False', 'new', 'async', 'await', 'export', 'default', 'try', 'catch', 'throw', 'elif', 'then', 'fi', 'echo', 'print', 'printf', 'using', 'namespace', 'std', 'auto', 'static', 'break', 'continue', 'switch', 'case', 'func', 'val', 'interface', 'type', 'package', 'fn'])
+  const re = /(\/\/[^\n]*|\/\*[\s\S]*?\*\/|#[^\n]*|<!--[\s\S]*?-->)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)|(\b\d+(?:\.\d+)?\b)|([A-Za-z_$][A-Za-z0-9_$]*)/g
+  let out = ''
+  let last = 0
+  let m
+  while ((m = re.exec(raw)) !== null) {
+    out += escapeHtml(raw.slice(last, m.index))
+    const text = m[0]
+    if (m[1]) {
+      if (text[0] === '#' && !isHashCommentLang(lang)) out += escapeHtml(text)
+      else out += `<span class="tok-comment">${escapeHtml(text)}</span>`
+    } else if (m[2]) {
+      out += `<span class="tok-string">${escapeHtml(text)}</span>`
+    } else if (m[3]) {
+      out += `<span class="tok-num">${escapeHtml(text)}</span>`
+    } else if (m[4]) {
+      out += KEYWORDS.has(text) ? `<span class="tok-key">${escapeHtml(text)}</span>` : escapeHtml(text)
+    }
+    last = re.lastIndex
+  }
+  out += escapeHtml(raw.slice(last))
+  return out
+}
+
+function renderCodeBlock(code, lang) {
+  const langLabel = (lang || 'text').toLowerCase()
+  return `<div class="code-block">
+    <div class="code-head"><span class="code-lang">${escapeHtml(langLabel)}</span><button class="code-copy" type="button">复制</button></div>
+    <pre><code class="language-${escapeHtml(langLabel)}">${highlightCode(code, langLabel)}</code></pre>
+  </div>`
+}
+
+function inlineMd(text) {
+  let s = escapeHtml(text)
+  s = s.replace(/`([^`]+)`/g, (_, c) => `<code class="inline">${c}</code>`)
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+  s = s.replace(/_([^_\n]+)_/g, '<em>$1</em>')
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, t, u) => `<a href="${u}" target="_blank" rel="noopener">${t}</a>`)
+  return s
+}
+
+function renderMarkdown(src) {
+  if (!src) return ''
+  const lines = String(src).replace(/\r\n/g, '\n').split('\n')
+  let html = ''
+  let inList = null
+  let i = 0
+  const closeList = () => { if (inList) { html += `</${inList}>`; inList = null } }
+  while (i < lines.length) {
+    const line = lines[i]
+    const fence = line.match(/^```(\w*)\s*$/)
+    if (fence) {
+      closeList()
+      const lang = fence[1] || ''
+      const buf = []
+      i++
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) { buf.push(lines[i]); i++ }
+      i++
+      html += renderCodeBlock(buf.join('\n'), lang)
+      continue
+    }
+    const h = line.match(/^(#{1,4})\s+(.*)$/)
+    if (h) { closeList(); const l = h[1].length; html += `<h${l}>${inlineMd(h[2])}</h${l}>`; i++; continue }
+    if (/^>\s?/.test(line)) {
+      closeList()
+      const buf = []
+      while (i < lines.length && /^>\s?/.test(lines[i])) { buf.push(lines[i].replace(/^>\s?/, '')); i++ }
+      html += `<blockquote>${inlineMd(buf.join(' '))}</blockquote>`
+      continue
+    }
+    const ul = line.match(/^[-*]\s+(.*)$/)
+    if (ul) { if (inList !== 'ul') { closeList(); html += '<ul>'; inList = 'ul' } html += `<li>${inlineMd(ul[1])}</li>`; i++; continue }
+    const ol = line.match(/^\d+\.\s+(.*)$/)
+    if (ol) { if (inList !== 'ol') { closeList(); html += '<ol>'; inList = 'ol' } html += `<li>${inlineMd(ol[1])}</li>`; i++; continue }
+    if (line.trim() === '') { closeList(); i++; continue }
+    closeList()
+    const buf = [line]; i++
+    while (i < lines.length && lines[i].trim() !== '' && !/^```/.test(lines[i]) && !/^(#{1,4})\s/.test(lines[i]) && !/^>\s?/.test(lines[i]) && !/^[-*]\s/.test(lines[i]) && !/^\d+\.\s/.test(lines[i])) { buf.push(lines[i]); i++ }
+    html += `<p>${inlineMd(buf.join('<br>'))}</p>`
+  }
+  closeList()
+  return html
+}
+
+// ── 事件监听 ──────────────────────────────────────────────
+
+function setupEventListeners() {
+  btnSend.addEventListener('click', sendMessage)
+  chatInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
+  })
+
+  btnReset.addEventListener('click', async () => {
+    if (!currentTaskId) return
+    await fetch(`${API}/api/reset`, { method: 'POST' })
+    renderChatWelcome()
+    executionLog.innerHTML = '<div class="log-empty">暂无执行记录</div>'
+    await loadTasks()
+  })
+
+  $('#btnRename').addEventListener('click', () => {
+    if (currentTaskId) {
+      // 从任务列表中找标题
+      const item = document.querySelector('.task-item.active .task-item-title')
+      renameTask(currentTaskId, item ? item.textContent.replace(/^● /, '') : '')
+    }
+  })
+
+  // Esc 关闭弹窗
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      document.querySelectorAll('.modal:not(.hidden)').forEach(m => m.classList.add('hidden'))
+    }
+  })
+
+  // 对话区点击代理：代码块复制 + 思考过程折叠
+  chatMessages.addEventListener('click', (e) => {
+    const copyBtn = e.target.closest('.code-copy')
+    if (copyBtn) {
+      const code = copyBtn.closest('.code-block')?.querySelector('code')
+      if (code) {
+        const text = code.textContent
+        const done = () => { const o = copyBtn.textContent; copyBtn.textContent = '已复制'; setTimeout(() => (copyBtn.textContent = o), 1200) }
+        if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done))
+        else fallbackCopy(text, done)
+      }
+      return
+    }
+    const head = e.target.closest('.ts-head')
+    if (head) head.closest('.thinking-stream')?.classList.toggle('collapsed')
+  })
+
+  // 点击遮罩关闭
+  document.querySelectorAll('.modal').forEach(m => {
+    m.addEventListener('click', (e) => {
+      if (e.target === m) m.classList.add('hidden')
+    })
+  })
+}
+
+// ── WebSocket ─────────────────────────────────────────────
+
+// ── 实时流辅助 ──────────────────────────────────────────
+
+function showThinking(text) {
+  const pill = $('#thinkingPill')
+  if (pill) { pill.textContent = text || '● 执行中…'; pill.classList.remove('hidden') }
+}
+
+function hideThinking() {
+  const pill = $('#thinkingPill')
+  if (pill) pill.classList.add('hidden')
+}
+
+// ── 流式"思考过程"气泡（与结果分离，可折叠）─────────────
+
+function createThinkBubble() {
+  const wrap = document.createElement('div')
+  wrap.className = 'message thinking-stream'
+  wrap.innerHTML = `
+    <div class="ts-head"><span class="chev">▾</span><span class="ts-label">💭 思考过程</span></div>
+    <div class="ts-body"><span class="ts-text"></span><span class="ts-cursor">▋</span></div>`
+  chatMessages.appendChild(wrap)
+  chatMessages.scrollTop = chatMessages.scrollHeight
+  return wrap
+}
+
+// 增量追加 token（首个非空 delta 才创建气泡，纯工具调用轮不留空气泡）
+function appendThinkToken(delta) {
+  if (!_thinkBubble) _thinkBubble = createThinkBubble()
+  window._lastThinkBubble = _thinkBubble
+  const t = _thinkBubble.querySelector('.ts-text')
+  t.textContent += delta
+  chatMessages.scrollTop = chatMessages.scrollHeight
+}
+
+function endThinkBubble() {
+  if (_thinkBubble) {
+    const c = _thinkBubble.querySelector('.ts-cursor')
+    if (c) c.remove()
+    _thinkBubble.classList.add('ended')
+    _thinkBubble = null
+  }
+}
+
+// 定稿：去掉打字光标，标记为正式思考记录并自动折叠（避免与结果重复刷屏）
+function finalizeThinkBubble(el) {
+  if (!el) return
+  el.classList.add('final', 'collapsed')
+  const c = el.querySelector('.ts-cursor')
+  if (c) c.remove()
+  const label = el.querySelector('.ts-label')
+  if (label) label.textContent = '💭 思考过程（生成轨迹）'
+}
+
+function fallbackCopy(text, done) {
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    ta.remove()
+    done()
+  } catch { /* ignore */ }
+}
+
+function updateTokenStat(data) {
+  if (tokenStat) {
+    tokenStat.textContent = `本次 ${(data.totalK ?? 0).toFixed(2)}K · ${data.tps ?? 0} t/s`
+  }
+}
+
+function resetTokenStat() {
+  if (tokenStat) tokenStat.textContent = '0.00K · 0 t/s'
+  window._thinkHadBubble = false
+  window._lastThinkBubble = null
+  _thinkBubble = null
+}
+
+function renderPlan(text) {
+  const section = $('#planSection')
+  const box = $('#planBox')
+  if (!section || !box) return
+  box.innerHTML = escapeHtml(text || '').replace(/\n/g, '<br>')
+  section.classList.remove('hidden')
+}
+
+function hidePlan() {
+  const section = $('#planSection')
+  if (section) section.classList.add('hidden')
+}
+
+function renderSafety(reason) {
+  addLogEntry('安全拦截', 'error')
+  const wrap = document.createElement('div')
+  wrap.className = 'message safety-banner'
+  wrap.innerHTML = `<span class="shield">🛡️</span><div><div class="safety-title">安全拦截</div><div class="safety-reason">${escapeHtml(reason || '')}</div></div>`
+  chatMessages.appendChild(wrap)
+  chatMessages.scrollTop = chatMessages.scrollHeight
+}
+
+function updateState(state) {
+  let cls = 'idle', txt = '就绪'
+  if (state === 'thinking') { cls = 'thinking'; txt = '思考中…' }
+  else if (state === 'tool_call') { cls = 'thinking'; txt = '调用工具…' }
+  else if (state === 'tool_result') { cls = 'thinking'; txt = '工具返回…' }
+  else if (state === 'responding') { cls = 'thinking'; txt = '回复中…' }
+  else if (state === 'error') { cls = 'error'; txt = '错误' }
+  statusIndicator.className = `status-dot ${cls}`
+  statusText.textContent = txt
+}
+
+// ── WebSocket ─────────────────────────────────────────────
+
+function setupWebSocket() {
+  const ws = new WebSocket(`ws://${location.host}`)
+  ws.onmessage = (e) => {
+    let msg
+    try { msg = JSON.parse(e.data) } catch { return }
+    const { event, data } = msg
+    switch (event) {
+      case 'state':
+        updateState(data.state); break
+      case 'planning':
+        showThinking('🧠 规划任务中…'); break
+      case 'step':
+        showThinking(`● 第 ${data.step} 步`)
+        addLogEntry(`第 ${data.step} 步`, 'calling')
+        break
+      case 'tool_call':
+        window._live = window._live || {}
+        window._live.gotTool = true
+        appendToolCall(data.name, data.arguments); break
+      case 'tool_result':
+        window._live = window._live || {}
+        window._live.gotTool = true
+        appendToolResult(data.name, data.result); break
+      case 'response':
+        window._live = window._live || {}
+        window._live.gotResponse = true
+        // thinking 与结果分离：定稿思考气泡（自动折叠），结果以独立 markdown 气泡呈现
+        if (window._thinkHadBubble && window._lastThinkBubble) {
+          finalizeThinkBubble(window._lastThinkBubble)
+          window._thinkHadBubble = false
+          window._lastThinkBubble = null
+        }
+        appendMessage('assistant', data.text)
+        hideThinking(); break
+      case 'token_start':
+        window._thinkHadBubble = true; break
+      case 'token':
+        if (data.delta) appendThinkToken(data.delta); break
+      case 'token_end':
+        endThinkBubble(); break
+      case 'usage':
+        updateTokenStat(data); break
+      case 'usage_reset':
+        resetTokenStat(); break
+      case 'plan':
+        renderPlan(data.text); break
+      case 'safety':
+        renderSafety(data.reason); break
+      case 'parse_error':
+        addLogEntry('格式解析错误', 'error'); break
+      default:
+        break
+    }
+  }
+  ws.onclose = () => setTimeout(setupWebSocket, 3000)
+}
+
+// ── 全局导出 ──────────────────────────────────────────────
+
+window.closeModal = closeModal
+window.closeModelsModal = closeModelsModal
+window.openSkillsModal = openSkillsModal
+window.openMcpModal = openMcpModal
+window.openProjectsModal = async () => {
+  $('#projectsModal').classList.remove('hidden')
+  await loadProjectsList()
+}
+window.onMcpTypeChange = onMcpTypeChange
+window.addMcpServer = addMcpServer
+window.connectMcp = connectMcp
+window.connectAllMcp = connectAllMcp
+window.disconnectMcp = disconnectMcp
+window.deleteMcpServer = deleteMcpServer
+window.createProject = createProject
+window.selectProject = selectProject
+window.deleteProject = deleteProject
+window.createNewTask = createNewTask
+window.confirmCreateTask = confirmCreateTask
+window.switchTask = switchTask
+window.renameTask = renameTask
+window.deleteTask = deleteTask
+window.activateSkill = activateSkill
+window.deactivateSkill = deactivateSkill
+window.createCustomSkill = createCustomSkill
+window.deleteSkill = deleteSkill
+window.onProviderChange = onProviderChange
+window.saveModel = saveModel
+window.testModel = testModel
+window.fetchModels = fetchModels
+window.onModelSelect = onModelSelect
+window.resetForm = resetForm
+window.editModel = editModel
+window.deleteModel = deleteModel
+window.activateModel = activateModel
+
+init()

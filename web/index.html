@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MiniAgent - 办公助手</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <!-- ═══ 左栏：项目 / 任务 / 新建任务 ═══ -->
+    <aside class="sidebar-left">
+      <div class="logo">
+        <h2>🤖 MiniAgent</h2>
+        <span class="subtitle">小模型办公助手</span>
+      </div>
+
+      <!-- 项目选择器 -->
+      <div class="project-selector" id="projectSelector">
+        <div class="project-current" id="projectCurrent" onclick="openProjectsModal()">
+          <span class="project-name" id="currentProjectName">默认项目</span>
+          <span class="project-caret">▾</span>
+        </div>
+      </div>
+
+      <!-- 新建任务 -->
+      <button class="btn-new-task" id="btnNewTask" onclick="createNewTask()">＋ 新建任务</button>
+
+      <!-- 任务列表 -->
+      <div class="tasks-section">
+        <div class="tasks-header">
+          <span>任务</span>
+          <span class="task-count" id="taskCount">0</span>
+        </div>
+        <div class="task-list" id="taskList">
+          <div class="task-empty">暂无任务，点击上方新建</div>
+        </div>
+      </div>
+
+      <!-- 底部功能区 -->
+      <nav class="nav-bottom">
+        <button class="nav-btn" onclick="openSkillsModal()" title="技能">⚡ 技能</button>
+        <button class="nav-btn" onclick="openModelsModal()" title="模型">🧠 模型</button>
+        <button class="nav-btn" onclick="openMcpModal()" title="MCP">🔌 MCP</button>
+      </nav>
+      <div class="status-bar">
+        <span id="statusIndicator" class="status-dot idle"></span>
+        <span id="statusText">就绪</span>
+        <span id="tokenStat" class="token-stat">0.00K · 0 t/s</span>
+      </div>
+    </aside>
+
+    <!-- ═══ 中栏：对话 ═══ -->
+    <main class="chat-main">
+      <div class="chat-header">
+        <h3 id="chatTitle">未选择任务</h3>
+        <div class="chat-actions">
+          <button id="btnRename" title="重命名任务">✏️</button>
+          <button id="btnReset" title="清空当前任务对话">🔄</button>
+        </div>
+      </div>
+      <div class="chat-messages" id="chatMessages">
+        <div class="welcome">
+          <h3>👋 你好！我是 MiniAgent</h3>
+          <p>一个专为小模型设计的办公助手。</p>
+          <p>先在左栏「＋ 新建任务」开始，你可以让我帮你：</p>
+          <ul>
+            <li>📁 整理文件和文件夹</li>
+            <li>📄 读写 CSV、JSON 文件</li>
+            <li>📝 批量处理文本</li>
+            <li>📊 生成简单报告</li>
+          </ul>
+          <p class="hint">💡 首次使用请配置模型（左栏 🧠 模型）</p>
+        </div>
+      </div>
+      <div class="chat-input-area">
+        <div id="thinkingPill" class="thinking-pill hidden">● 执行中…</div>
+        <div class="input-row">
+          <textarea id="chatInput" placeholder="输入消息... (Enter 发送)" rows="2"></textarea>
+          <button id="btnSend" class="btn-send">发送</button>
+        </div>
+      </div>
+    </main>
+
+    <!-- ═══ 右栏：日志与工具 ═══ -->
+    <aside class="sidebar-right">
+      <div class="panel-section plan-section hidden" id="planSection">
+        <h3>📌 执行计划</h3>
+        <div id="planBox" class="plan-box"></div>
+      </div>
+      <div class="panel-section">
+        <h3>📋 执行日志</h3>
+        <div id="executionLog" class="execution-log">
+          <div class="log-empty">暂无执行记录</div>
+        </div>
+      </div>
+      <div class="panel-section">
+        <h3>🔧 可用工具</h3>
+        <div id="toolsList" class="tools-list"></div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- ═══ 项目管理弹窗 ═══ -->
+  <div id="projectsModal" class="modal hidden">
+    <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h3>📁 项目管理</h3>
+        <button class="modal-close" onclick="closeModal('projectsModal')">✕</button>
+      </div>
+      <div class="models-section">
+        <h4>我的项目</h4>
+        <div id="projectsList" class="models-list"></div>
+      </div>
+      <div class="models-section">
+        <h4>新建项目</h4>
+        <div class="model-form">
+          <div class="form-row">
+            <label>项目名称</label>
+            <input id="pName" type="text" placeholder="如：财务报表整理">
+          </div>
+          <div class="form-row">
+            <label>工作目录（相对服务端工作区，默认 .）</label>
+            <input id="pDir" type="text" placeholder="." value=".">
+          </div>
+          <div class="form-actions">
+            <button class="btn-primary" onclick="createProject()">创建项目</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ 技能弹窗 ═══ -->
+  <div id="skillsModal" class="modal hidden">
+    <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h3>⚡ 技能</h3>
+        <button class="modal-close" onclick="closeModal('skillsModal')">✕</button>
+      </div>
+      <div class="models-section">
+        <h4>激活技能后，其指令将注入对话（按步骤引导执行）</h4>
+        <div id="skillsFullList" class="models-list"></div>
+      </div>
+      <div class="models-section">
+        <h4>自定义技能</h4>
+        <div class="model-form">
+          <div class="form-row">
+            <label>技能名称（英文标识）</label>
+            <input id="skName" type="text" placeholder="my_skill">
+          </div>
+          <div class="form-row">
+            <label>描述</label>
+            <input id="skDesc" type="text" placeholder="技能的一句话描述">
+          </div>
+          <div class="form-row">
+            <label>指令（告诉模型怎么做这件事，支持 {参数名} 占位符）</label>
+            <textarea id="skInstruction" rows="4" placeholder="执行步骤：1) ... 2) ..."></textarea>
+          </div>
+          <div class="form-actions">
+            <button class="btn-primary" onclick="createCustomSkill()">保存技能</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ MCP 弹窗 ═══ -->
+  <div id="mcpModal" class="modal hidden">
+    <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h3>🔌 MCP 服务器</h3>
+        <button class="modal-close" onclick="closeModal('mcpModal')">✕</button>
+      </div>
+      <div class="models-section">
+        <h4>已配置服务器</h4>
+        <div id="mcpServersList" class="models-list"></div>
+      </div>
+      <div class="models-section">
+        <h4>添加服务器</h4>
+        <div class="model-form">
+          <div class="form-row-group">
+            <div class="form-row">
+              <label>名称</label>
+              <input id="mcpName" type="text" placeholder="my-server">
+            </div>
+            <div class="form-row">
+              <label>类型</label>
+              <select id="mcpType" onchange="onMcpTypeChange()">
+                <option value="stdio">stdio（本地命令）</option>
+                <option value="http">HTTP</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row" id="mcpStdioRow">
+            <label>命令（如 npx / uvx / node）</label>
+            <div class="model-id-row">
+              <input id="mcpCommand" type="text" placeholder="npx">
+              <input id="mcpArgs" type="text" placeholder="-y @some/mcp-server">
+            </div>
+          </div>
+          <div class="form-row hidden" id="mcpHttpRow">
+            <label>URL</label>
+            <input id="mcpUrl" type="text" placeholder="https://example.com/mcp">
+          </div>
+          <div class="form-actions">
+            <button class="btn-primary" onclick="addMcpServer()">添加</button>
+            <button class="btn-secondary" onclick="connectAllMcp()">连接全部</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ 模型管理弹窗 ═══ -->
+  <div id="modelsModal" class="modal hidden">
+    <div class="modal-content modal-wide">
+      <div class="modal-header">
+        <h3>🧠 模型管理</h3>
+        <button class="modal-close" onclick="closeModelsModal()">✕</button>
+      </div>
+
+      <div class="models-section">
+        <h4>已配置模型</h4>
+        <div id="modelsList" class="models-list"></div>
+      </div>
+
+      <div class="models-section">
+        <h4 id="modelFormTitle">添加新模型</h4>
+        <div class="model-form">
+          <div class="form-row">
+            <label>提供商模板</label>
+            <select id="mProvider" onchange="onProviderChange()">
+              <option value="ollama">Ollama (本地)</option>
+              <option value="deepseek">DeepSeek</option>
+              <option value="qwen">通义千问</option>
+              <option value="moonshot">Moonshot</option>
+              <option value="zhipu">智谱 GLM</option>
+              <option value="openai">OpenAI</option>
+              <option value="custom">自定义</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>显示名称</label>
+            <input id="mName" type="text" placeholder="我的 DeepSeek">
+          </div>
+          <div class="form-row">
+            <label>API 地址</label>
+            <input id="mBaseURL" type="text" placeholder="https://api.deepseek.com/v1">
+          </div>
+          <div class="form-row">
+            <label>API Key</label>
+            <input id="mApiKey" type="password" placeholder="sk-...">
+          </div>
+          <div class="form-row">
+            <label>模型 ID</label>
+            <div class="model-id-row">
+              <input id="mModel" type="text" placeholder="deepseek-chat">
+              <button class="btn-fetch" onclick="fetchModels()">获取列表</button>
+            </div>
+            <select id="mModelSelect" class="hidden" onchange="onModelSelect()">
+              <option value="">-- 选择模型 --</option>
+            </select>
+          </div>
+          <div class="form-row-group">
+            <div class="form-row">
+              <label>Max Tokens</label>
+              <input id="mMaxTokens" type="number" value="2048">
+            </div>
+            <div class="form-row">
+              <label>上下文长度</label>
+              <input id="mContextLength" type="number" value="32768">
+            </div>
+            <div class="form-row">
+              <label>Temperature</label>
+              <input id="mTemperature" type="number" value="0.3" step="0.1" min="0" max="2">
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn-primary" onclick="saveModel()">保存</button>
+            <button class="btn-secondary" onclick="testModel()">测试连接</button>
+            <button class="btn-secondary" onclick="resetForm()">清空</button>
+          </div>
+          <div id="testResult" class="test-result hidden"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ 任务参数弹窗（新建任务时输入标题）═══ -->
+  <div id="taskModal" class="modal hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>＋ 新建任务</h3>
+        <button class="modal-close" onclick="closeModal('taskModal')">✕</button>
+      </div>
+      <div class="model-form">
+        <div class="form-row">
+          <label>任务标题</label>
+          <input id="taskTitle" type="text" placeholder="如：整理下载文件夹" maxlength="50">
+        </div>
+        <div class="form-actions">
+          <button class="btn-primary" onclick="confirmCreateTask()">创建</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

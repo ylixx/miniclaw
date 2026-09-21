@@ -1,0 +1,15 @@
+{
+  "name": "miniagent",
+  "version": "2.0.0",
+  "description": "Lightweight Agent for small models - Office focused, MCP supported, Multi-model",
+  "type": "module",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "cors": "^2.8.5",
+    "ws": "^8.18.0"
+  }
+}
