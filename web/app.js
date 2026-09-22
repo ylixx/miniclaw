@@ -14,6 +14,7 @@ let isLoading = false
 let editingModelId = null
 let currentProjectId = null
 let currentTaskId = null
+let taskDirMap = {}      // taskId -> 有效工作区绝对路径（来自 listTasks）
 let _thinkBubble = null  // 当前流式"思考气泡"元素
 
 const $ = (sel) => document.querySelector(sel)
@@ -131,6 +132,67 @@ async function deleteProject(id) {
   await loadStatus()
 }
 
+// ── 工作区选择（新建/选本地文件夹）─────────────────────────
+
+function setupWorkspacePicker() {
+  const radios = document.querySelectorAll('input[name="wsMode"]')
+  const pickRow = document.getElementById('wsPickRow')
+  const hint = document.getElementById('wsHint')
+  const sync = () => {
+    const mode = document.querySelector('input[name="wsMode"]:checked')?.value || 'new'
+    if (pickRow) pickRow.classList.toggle('hidden', mode !== 'pick')
+    if (hint) hint.textContent = mode === 'pick'
+      ? '粘贴本地文件夹的绝对路径（如 D:\\work\\myproject）；或点"浏览"选文件夹名（建在服务端工作区内）。后端会校验目录存在。'
+      : '输入文件夹名（建在服务端工作区内）或绝对路径；后端会自动创建不存在的目录。'
+  }
+  radios.forEach(r => r.addEventListener('change', sync))
+  sync()
+  const picker = document.getElementById('pDirPicker')
+  if (picker) picker.addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0]
+    if (f) {
+      // 浏览器安全限制：仅暴露相对于所选目录的名（webkitRelativePath 首段）
+      const name = (f.webkitRelativePath || f.name).split(/[/\\]/)[0]
+      const input = document.getElementById('pDir')
+      if (input) input.value = name
+    }
+    e.target.value = ''
+  })
+}
+
+// 任务弹窗的工作区选择（与项目弹窗同逻辑，但用独立的 id，避免冲突）
+let _taskWsBound = false
+function taskWsSync() {
+  const mode = document.querySelector('input[name="taskWsMode"]:checked')?.value || ''
+  const pickRow = document.getElementById('taskWsPickRow')
+  const hint = document.getElementById('taskWsHint')
+  if (pickRow) pickRow.classList.toggle('hidden', mode !== 'pick')
+  if (hint) {
+    if (mode === 'pick') hint.textContent = '粘贴本地文件夹的绝对路径（如 D:\\work\\mytask）；或点"浏览"选文件夹名（建在服务端工作区内）。后端会校验目录存在。'
+    else if (mode === 'new') hint.textContent = '输入文件夹名（建在服务端工作区内）或绝对路径；后端会自动创建不存在的目录。'
+    else if (mode === 'inherit') hint.textContent = '沿用当前项目的工作区（与项目共享同一文件夹）。'
+    else hint.textContent = ''
+  }
+}
+function onTaskDirPick(e) {
+  const f = e.target.files && e.target.files[0]
+  if (f) {
+    const name = (f.webkitRelativePath || f.name).split(/[/\\]/)[0]
+    const input = document.getElementById('taskDir')
+    if (input) input.value = name
+  }
+  e.target.value = ''
+}
+function setupTaskWorkspacePicker() {
+  if (!_taskWsBound) {
+    document.querySelectorAll('input[name="taskWsMode"]').forEach(r => r.addEventListener('change', taskWsSync))
+    const picker = document.getElementById('taskDirPicker')
+    if (picker) picker.addEventListener('change', onTaskDirPick)
+    _taskWsBound = true
+  }
+  taskWsSync()
+}
+
 // ── 任务 ──────────────────────────────────────────────────
 
 async function loadTasks() {
@@ -141,6 +203,8 @@ async function loadTasks() {
   }
   const res = await fetch(`${API}/api/projects/${currentProjectId}/tasks`)
   const tasks = await res.json()
+  taskDirMap = {}
+  tasks.forEach(t => { taskDirMap[t.id] = t.dir || '' })
   $('#taskCount').textContent = tasks.length
   $('#taskList').innerHTML = tasks.map(t => `
     <div class="task-item ${t.id === currentTaskId ? 'active' : ''}" onclick="switchTask('${t.id}')" title="${escapeHtml(t.title)}">
@@ -156,22 +220,45 @@ async function loadTasks() {
 
 function createNewTask() {
   $('#taskTitle').value = ''
+  // 重置工作区选择（强制手动选，不预选）
+  document.querySelectorAll('input[name="taskWsMode"]').forEach(r => { r.checked = false })
+  const td = $('#taskDir'); if (td) td.value = ''
+  const pr = $('#taskWsPickRow'); if (pr) pr.classList.add('hidden')
+  const hint = $('#taskWsHint'); if (hint) hint.textContent = ''
   $('#taskModal').classList.remove('hidden')
+  setupTaskWorkspacePicker()
   setTimeout(() => $('#taskTitle').focus(), 50)
 }
 
 async function confirmCreateTask() {
   const title = $('#taskTitle').value.trim() || `任务 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`
   if (!currentProjectId) return alert('请先在项目中选择或创建一个项目')
+
+  // 工作区：强制手动选择一种方式
+  const mode = document.querySelector('input[name="taskWsMode"]:checked')?.value
+  if (!mode) return alert('请先选择任务工作区方式（新建文件夹 / 选择本地文件夹 / 继承项目工作区）')
+  let dir = ''
+  if (mode === 'new' || mode === 'pick') {
+    dir = $('#taskDir').value.trim()
+    if (!dir) return alert(mode === 'pick' ? '请填写或浏览选择本地文件夹路径' : '请填写新建文件夹名称或绝对路径')
+  }
+  // inherit 模式不传 dir，后端回退到项目工作区
+
   const res = await fetch(`${API}/api/projects/${currentProjectId}/tasks`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title }),
+    body: JSON.stringify({ title, dir: mode === 'inherit' ? undefined : dir }),
   })
   const data = await res.json()
   if (data.error) return alert(`创建失败: ${data.error}`)
   closeModal('taskModal')
   currentTaskId = data.task.id
+  taskDirMap[data.task.id] = data.task.dir || taskDirMap[data.task.id] || ''
+  if (!taskDirMap[data.task.id]) {
+    // 回退到项目工作区（inherit 模式时后端未返回任务级 dir）
+    const pres = await fetch(`${API}/api/projects/${currentProjectId}`).then(r => r.json()).catch(() => null)
+    taskDirMap[data.task.id] = pres?.dir || ''
+  }
   renderChatWelcome(title)
   await loadTasks()
   renderChatTitle()
@@ -185,6 +272,8 @@ async function switchTask(taskId, { silent } = {}) {
   // 找到所属项目并切换
   const tres = await fetch(`${API}/api/tasks/${taskId}`)
   const tdata = await tres.json()
+  // 记录本任务的有效工作区（任务级优先，否则项目级）
+  taskDirMap[taskId] = (tdata.task && tdata.task.dir) || (tdata.project && tdata.project.dir) || taskDirMap[taskId] || ''
   if (tdata.project && tdata.project.id !== currentProjectId) {
     currentProjectId = tdata.project.id
     await loadTasks()
@@ -249,11 +338,14 @@ async function deleteTask(taskId) {
 
 function renderChatTitle() {
   const titleEl = $('#chatTitle')
+  const wsEl = $('#chatWorkspace')
   if (currentTaskId) {
     titleEl.textContent = '对话'
     titleEl.dataset.taskTitle = ''
+    if (wsEl) wsEl.textContent = taskDirMap[currentTaskId] || ''
   } else {
     titleEl.textContent = '未选择任务'
+    if (wsEl) wsEl.textContent = ''
   }
 }
 
@@ -1010,6 +1102,9 @@ function setupEventListeners() {
       renameTask(currentTaskId, item ? item.textContent.replace(/^● /, '') : '')
     }
   })
+
+  // 工作区选择（新建项目弹窗）：新建文件夹 / 选择本地文件夹
+  setupWorkspacePicker()
 
   // 技能包（zip）一键安装：点击按钮触发文件选择，选中后上传
   const btnInstallSkill = document.getElementById('btnInstallSkill')

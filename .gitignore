@@ -7,6 +7,9 @@ node_modules/
 # Local backup snapshots (not source code)
 .backup/
 
+# Agent workspace: generated artifacts / tools / temp files (not source code)
+workspace/
+
 # Logs
 *.log
 npm-debug.log*

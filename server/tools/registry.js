@@ -85,6 +85,16 @@ export class ToolRegistry {
   }
 
   /**
+   * 解析工具名：精确命中返回原名，否则模糊匹配，都不中返回 null。
+   * 供引擎在"子集外工具自动扩容"前判定工具是否真实存在。
+   */
+  resolveName(name) {
+    if (!name) return null
+    if (this.tools.has(name) || this._mcpTools.has(name)) return name
+    return this._fuzzyMatch(name)
+  }
+
+  /**
    * 模糊匹配：返回距离最近的已知工具名（阈值内），否则 null。
    * 使用 Levenshtein 距离，阈值随名称长度自适应。
    */

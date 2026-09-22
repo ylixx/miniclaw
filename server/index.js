@@ -18,6 +18,10 @@ import { AgentEngine } from './agent/engine.js'
 import { ToolRegistry } from './tools/registry.js'
 import { registerFileOps } from './tools/file-ops.js'
 import { registerDocOps } from './tools/doc-ops.js'
+import { registerPptxOps } from './tools/pptx-ops.js'
+import { registerDocxOps } from './tools/docx-ops.js'
+import { registerXlsxOps } from './tools/xlsx-ops.js'
+import { registerPdfOps } from './tools/pdf-ops.js'
 import { registerShell } from './tools/shell.js'
 import { MCPClient } from './mcp/client.js'
 import { SkillsManager } from './skills/loader.js'
@@ -33,10 +37,23 @@ const CONFIG_DIR = process.env.CONFIG_DIR || path.join(process.env.HOME || proce
 
 // ── 初始化组件 ──────────────────────────────────────────────────
 
+// 动态工作目录：取当前激活项目目录，无激活项目时回退到 BASE_DIR
+function getBaseDir() {
+  try {
+    return (workspace && typeof workspace.getActiveDir === 'function' && workspace.getActiveDir()) || BASE_DIR
+  } catch {
+    return BASE_DIR
+  }
+}
+
 const tools = new ToolRegistry()
-registerFileOps(tools, { baseDir: BASE_DIR, getPermissionMode: () => getModelConfig().permissionMode })
-registerDocOps(tools, { baseDir: BASE_DIR })
-registerShell(tools, { baseDir: BASE_DIR, getPermissionMode: () => getModelConfig().permissionMode })
+registerFileOps(tools, { getBaseDir, getPermissionMode: () => getModelConfig().permissionMode })
+registerDocOps(tools, { getBaseDir })
+registerPptxOps(tools, { getBaseDir })
+registerDocxOps(tools, { getBaseDir })
+registerXlsxOps(tools, { getBaseDir })
+registerPdfOps(tools, { getBaseDir })
+registerShell(tools, { getBaseDir, getPermissionMode: () => getModelConfig().permissionMode })
 
 const mcp = new MCPClient(CONFIG_DIR, BASE_DIR)
 const skills = new SkillsManager(CONFIG_DIR)
@@ -60,7 +77,7 @@ function getModelConfig() {
       contextLength: 32768,
       maxSteps: 8,
       temperature: 0.3,
-      baseDir: BASE_DIR,
+      baseDir: getBaseDir(),
       permissionMode: process.env.PERMISSION_MODE || 'guarded',
     }
   }
@@ -72,7 +89,7 @@ function getModelConfig() {
     contextLength: active.contextLength || 32768,
     maxSteps: 8,
     temperature: active.temperature || 0.3,
-    baseDir: BASE_DIR,
+    baseDir: getBaseDir(),
     permissionMode: process.env.PERMISSION_MODE || active.permissionMode || 'guarded',
   }
 }
@@ -157,6 +174,21 @@ app.post('/api/chat', async (req, res) => {
 
 // ── 状态 API ───────────────────────────────────────────────────
 
+// 轻量健康探活（供 agent/监控用 curl http://localhost:3000/health）
+// 与 /api/status 区别：前者只返回是否存活，后者返回完整状态。
+function healthPayload() {
+  return {
+    ok: true,
+    status: 'healthy',
+    uptime: Math.floor(process.uptime()),
+    time: new Date().toISOString(),
+    tools: tools.list().length,
+    mcpServers: mcp.listServers().length,
+  }
+}
+app.get('/health', (req, res) => res.json(healthPayload()))
+app.get('/api/health', (req, res) => res.json(healthPayload()))
+
 app.get('/api/status', (req, res) => {
   const active = modelManager.getActive()
   const activeTask = workspace.getActiveTask()
@@ -232,6 +264,7 @@ app.post('/api/tasks/:id/activate', async (req, res) => {
       success: true,
       task: { ...found.task, messages: undefined },
       messages: found.task.messages || [],
+      project: { id: found.project.id, name: found.project.name, dir: found.project.dir },
     })
   } catch (err) {
     res.status(400).json({ error: err.message })
@@ -245,7 +278,7 @@ app.get('/api/tasks/:id', (req, res) => {
   res.json({
     task: { ...found.task, messages: undefined },
     messages: found.task.messages || [],
-    project: { id: found.project.id, name: found.project.name },
+    project: { id: found.project.id, name: found.project.name, dir: found.project.dir },
   })
 })
 

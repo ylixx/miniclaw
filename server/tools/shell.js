@@ -11,14 +11,15 @@
  * 4. 超时保护（默认 30s，最长 120s）+ 输出上限（8MB）。
  */
 
-import { spawnSync } from 'child_process'
+import { spawn } from 'child_process'
 import { checkCommandLine, checkPermissionMode } from './safety-gate.js'
 
 const DEFAULT_TIMEOUT = 30      // 秒
 const MAX_TIMEOUT = 120         // 秒
-const MAX_OUT = 8000            // 单段输出字符上限
+const MAX_OUT = 8000            // 单段输出字符上限（返回给模型的截断长度）
+const HARD_CAP = 8 * 1024 * 1024 // 异步累积输出字节硬上限，防大输出撑爆内存
 
-export function registerShell(registry, { baseDir, getPermissionMode } = {}) {
+export function registerShell(registry, { getBaseDir, getPermissionMode } = {}) {
   // 实时读取权限模式（与 file-ops 一致，支持模型切换后动态生效）
   const getMode = () => (getPermissionMode && getPermissionMode()) || 'guarded'  // guarded | read-only | unattended
 
@@ -64,34 +65,76 @@ export function registerShell(registry, { baseDir, getPermissionMode } = {}) {
         }
       }
 
-      const r = spawnSync(runCmd, [], {
-        shell: true,            // Windows: cmd /c <command>
-        cwd: baseDir,           // 锁定工作目录
-        windowsHide: true,
-        encoding: 'utf-8',
-        timeout: tSec * 1000,
-        maxBuffer: 8 * 1024 * 1024,
-        env: { ...process.env },
-      })
+      // ── 异步执行（关键：绝不能 spawnSync，否则冻结事件循环）──
+      // 旧实现用 spawnSync 同步阻塞 Node 事件循环：当命令里 curl 本服务
+      // (localhost:3000) 时，服务器自身事件循环被冻住无法响应，导致 curl
+      // 必超时死锁（这也是此前 /health 全 ETIMEDOUT 的真因）。
+      // 改用异步 spawn，事件循环始终空闲，自连本服的 curl 可正常往返。
+      return new Promise((resolve) => {
+        let stdout = ''
+        let stderr = ''
+        let timedOut = false
+        let capHit = false
 
-      if (r.error) {
-        const msg = r.error.code === 'ETIMEDOUT'
-          ? `命令执行超时（>${tSec}s）`
-          : `命令执行失败：${r.error.message}`
-        return {
-          error: msg,
-          code: r.error.code || 'EXEC_ERROR',
-          stdout: (r.stdout || '').slice(0, MAX_OUT),
-          stderr: (r.stderr || '').slice(0, MAX_OUT),
+        const child = spawn(runCmd, [], {
+          shell: true,            // Windows: cmd.exe /c <command>
+          cwd: getBaseDir(),     // 锁定工作目录（当前激活项目 dir）
+          windowsHide: true,
+          env: { ...process.env },
+        })
+        child.stdout?.setEncoding('utf8')
+        child.stderr?.setEncoding('utf8')
+
+        const timer = setTimeout(() => {
+          timedOut = true
+          // Windows：杀掉进程树（/T 含子进程），避免残留
+          try {
+            spawn('taskkill', ['/PID', String(child.pid), '/F', '/T'], {
+              windowsHide: true,
+              detached: true,
+              stdio: 'ignore',
+            }).unref?.()
+          } catch { /* ignore */ }
+        }, tSec * 1000)
+
+        const onData = (chunk, key) => {
+          if (capHit) return
+          if (stdout.length + stderr.length > HARD_CAP) { capHit = true; return }
+          if (key === 'out') stdout += chunk
+          else stderr += chunk
         }
-      }
+        child.stdout?.on('data', (d) => onData(d, 'out'))
+        child.stderr?.on('data', (d) => onData(d, 'err'))
 
-      // 命令退出（exitCode 为 null 时多为被信号终止）
-      return {
-        stdout: (r.stdout || '').slice(0, MAX_OUT),
-        stderr: (r.stderr || '').slice(0, MAX_OUT),
-        exitCode: r.status ?? (r.signal ? `signal:${r.signal}` : -1),
-      }
+        child.on('error', (err) => {
+          clearTimeout(timer)
+          resolve({
+            error: `命令执行失败：${err.message}`,
+            code: err.code || 'EXEC_ERROR',
+            stdout: stdout.slice(0, MAX_OUT),
+            stderr: stderr.slice(0, MAX_OUT),
+          })
+        })
+
+        child.on('close', (code, signal) => {
+          clearTimeout(timer)
+          if (timedOut) {
+            resolve({
+              error: `命令执行超时（>${tSec}s）`,
+              code: 'ETIMEDOUT',
+              stdout: stdout.slice(0, MAX_OUT),
+              stderr: stderr.slice(0, MAX_OUT),
+            })
+          } else {
+            // 命令退出（exitCode 为 null 时多为被信号终止）
+            resolve({
+              stdout: stdout.slice(0, MAX_OUT),
+              stderr: stderr.slice(0, MAX_OUT),
+              exitCode: code ?? (signal ? `signal:${signal}` : -1),
+            })
+          }
+        })
+      })
     },
   })
 }

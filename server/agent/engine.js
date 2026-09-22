@@ -14,6 +14,7 @@ import { buildPrompt, buildToolResult } from './prompt.js'
 import { parseResponse, buildToolFormatHint } from './parser.js'
 import { ContextManager } from './context.js'
 import { checkPermissionMode } from '../tools/safety-gate.js'
+import { selectTools, READ_ONLY_WHITELIST } from './tool-router.js'
 
 // ─── Agent 状态 ──────────────────────────────────────────────────
 
@@ -45,6 +46,7 @@ export class AgentEngine {
     this.goal = null
     this.currentPlan = null
     this._selfVerifyHint = null
+    this._scope = null         // 当前注入的工具子集（4B 减负：只给相关工具）
     this.onEvent = null          // 事件回调
     this._activeTaskId = null    // 当前绑定任务
   }
@@ -74,9 +76,11 @@ export class AgentEngine {
    * 获取当前工作目录（项目绑定目录）
    */
   getWorkDir() {
-    if (!this.workspace || !this._activeTaskId) return this.config.baseDir || process.cwd()
-    const found = this.workspace.findTask(this._activeTaskId)
-    return found ? found.project.dir : this.config.baseDir || process.cwd()
+    if (this.workspace) {
+      const d = this.workspace.getActiveDir()
+      if (d) return d
+    }
+    return this.config.baseDir || process.cwd()
   }
 
   // ── 消息处理 ───────────────────────────────────────────────
@@ -88,6 +92,9 @@ export class AgentEngine {
     // 添加用户消息到历史
     this.history.push({ role: 'user', content: userMessage })
     this.goal = userMessage  // 记录用户目标，供目标评估循环使用
+
+    // 工具子集路由（A 技能 / B 意图）：每轮用户消息重算一次，减少注入量
+    this._refreshToolScope(userMessage)
 
     // 规划前置（s05）：复杂任务先让模型产出步骤清单，提升 4B 模型多步稳定性
     if (this.config.planning !== false && this._looksMultiStep(userMessage)) {
@@ -107,10 +114,11 @@ export class AgentEngine {
         stepCount++
         this._emit('step', { step: stepCount })
 
-        // 1. 构建 prompt（注入工作目录 + 技能指令 + MCP 工具 + 计划 + 自校验提示）
+        // 1. 构建 prompt（注入工作目录 + 技能指令 + 工具子集 + 计划 + 自校验提示）
         const prompt = buildPrompt({
           history: this.history,
-          tools: this.tools.getSchemas(),
+          tools: this._scope.tools,
+          toolScope: this._scope,
           skills: this.skills.list ? this.skills.list() : [],
           skillContext: this.skills.getPromptContext ? this.skills.getPromptContext() : '',
           config: this.config,
@@ -128,7 +136,7 @@ export class AgentEngine {
         this._emit('token_start')
         const rawResponse = await this._callModel(
           prompt,
-          this._toOpenAITools(this.tools.getSchemas()),
+          this._toOpenAITools(this._scope.tools),
           { onDelta: (d) => this._emit('token', { delta: d }) }
         )
         this._emit('token_end')
@@ -171,9 +179,18 @@ export class AgentEngine {
             if (block) {
               result = { error: block, code: 'PERMISSION_MODE' }
             } else {
-              result = await this.tools.execute(name, args)
-              if (result && result.isError) {
-                result = { error: result.content }
+              // 子集外工具：先解析（模糊纠名），存在即自动扩容，避免"省 token"变成"任务卡死"
+              const resolved = this.tools.resolveName ? this.tools.resolveName(name) : name
+              if (!resolved || !this._ensureTool(resolved)) {
+                result = {
+                  error: `未知工具: ${name}。当前可用: ${this._scope.names.join ? [...this._scope.names].join(', ') : ''}`,
+                  code: 'TOOL_NOT_FOUND',
+                }
+              } else {
+                result = await this.tools.execute(resolved, args)
+                if (result && result.isError) {
+                  result = { error: result.content }
+                }
               }
             }
           } catch (err) {
@@ -228,7 +245,7 @@ export class AgentEngine {
           }
           this.history.push({
             role: 'system',
-            content: `[格式错误] 你的回复无法解析为工具调用。${buildToolFormatHint(this.tools.getSchemas())}\n错误详情：${parsed.error || ''}`,
+            content: `[格式错误] 你的回复无法解析为工具调用。${buildToolFormatHint(this._scope ? this._scope.tools : this.tools.getSchemas())}\n错误详情：${parsed.error || ''}`,
           })
           this._emit('parse_error', { error: parsed.error, raw: rawResponse })
           continue
@@ -247,6 +264,47 @@ export class AgentEngine {
     } finally {
       this._parseErrorCount = 0
     }
+  }
+
+  // ── 工具子集路由（4B 减负）───────────────────────────────
+
+  /**
+   * 重算本轮要注入的工具子集：技能优先，其次意图关键词，兜底 core。
+   */
+  _refreshToolScope(message) {
+    const all = this.tools.getSchemas()
+    const activeSkills = (this.skills && Array.isArray(this.skills.active)) ? this.skills.active : []
+    const scope = selectTools({
+      schemas: all,
+      activeSkills,
+      message,
+      permissionMode: this.permissionMode,
+    })
+    scope.allCount = all.length
+    this._scope = scope
+    this._emit('tool_scope', {
+      groups: scope.groups,
+      source: scope.source,
+      count: scope.tools.length,
+      all: all.length,
+    })
+    return scope
+  }
+
+  /**
+   * 逃生舱：模型调用了子集外但确实存在的工具时，动态扩容并放行。
+   * 只读模式下白名单外一律拒绝。
+   */
+  _ensureTool(name) {
+    if (!this._scope) return false
+    if (this._scope.names.has(name)) return true
+    if (this.permissionMode === 'read-only' && !READ_ONLY_WHITELIST.includes(name)) return false
+    const hit = this.tools.getSchemas().find(t => t.name === name)
+    if (!hit) return false
+    this._scope.tools.push(hit)
+    this._scope.names.add(name)
+    this._emit('tool_scope_expand', { name, count: this._scope.tools.length })
+    return true
   }
 
   /**
@@ -538,6 +596,7 @@ export class AgentEngine {
     this.history = []
     this.state = AgentState.IDLE
     this._parseErrorCount = 0
+    this._scope = null
     this._tokenStats = { prompt: 0, completion: 0, requests: 0 }
     this._emit('usage_reset', {})
     this._emit('state', { state: this.state })
@@ -553,6 +612,12 @@ export class AgentEngine {
       historyLength: this.history.length,
       steps: this.history.filter(m => m.role === 'tool').length,
       taskId: this._activeTaskId,
+      toolScope: this._scope ? {
+        groups: this._scope.groups,
+        source: this._scope.source,
+        count: this._scope.tools.length,
+        all: this._scope.allCount,
+      } : null,
     }
   }
 

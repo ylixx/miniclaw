@@ -187,6 +187,8 @@ body {
   display: flex; justify-content: space-between; align-items: center;
 }
 .chat-header h3 { font-size: 15px; font-weight: 600; }
+.chat-workspace { font-size: 12px; color: var(--text-secondary); max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-workspace::before { content: '📁 '; }
 .chat-actions button {
   background: none; border: none; cursor: pointer; font-size: 18px;
   padding: 4px 8px; border-radius: 6px; color: var(--text-secondary);

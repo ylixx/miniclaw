@@ -55,6 +55,7 @@
     <main class="chat-main">
       <div class="chat-header">
         <h3 id="chatTitle">未选择任务</h3>
+        <div id="chatWorkspace" class="chat-workspace"></div>
         <div class="chat-actions">
           <button id="btnRename" title="重命名任务">✏️</button>
           <button id="btnReset" title="清空当前任务对话">🔄</button>
@@ -121,8 +122,18 @@
             <input id="pName" type="text" placeholder="如：财务报表整理">
           </div>
           <div class="form-row">
-            <label>工作目录（相对服务端工作区，默认 .）</label>
-            <input id="pDir" type="text" placeholder="." value=".">
+            <label>工作区（agent 文件读写 / 命令执行的根目录）</label>
+            <div style="display:flex;gap:18px;margin:4px 0 8px">
+              <label style="display:flex;align-items:center;gap:4px"><input type="radio" name="wsMode" value="new" checked> 新建文件夹</label>
+              <label style="display:flex;align-items:center;gap:4px"><input type="radio" name="wsMode" value="pick"> 选择本地文件夹</label>
+            </div>
+            <input id="pDir" type="text" placeholder="文件夹名或绝对路径，如 myproject 或 D:\work\myproject">
+            <div id="wsHint" style="color:#9aa0a6;font-size:12px;margin-top:4px"></div>
+            <div id="wsPickRow" class="hidden" style="margin-top:6px">
+              <input type="file" id="pDirPicker" webkitdirectory directory multiple style="display:none">
+              <button type="button" class="btn" onclick="document.getElementById('pDirPicker').click()">浏览本机文件夹…</button>
+              <span style="color:#9aa0a6;font-size:12px">浏览器安全限制：只能取文件夹名（建在服务端工作区内），绝对路径请用上方输入框粘贴</span>
+            </div>
           </div>
           <div class="form-actions">
             <button class="btn-primary" onclick="createProject()">创建项目</button>
@@ -304,6 +315,21 @@
         <div class="form-row">
           <label>任务标题</label>
           <input id="taskTitle" type="text" placeholder="如：整理下载文件夹" maxlength="50">
+        </div>
+        <div class="form-row">
+          <label>任务工作区（本任务所有文件读写 / 命令都在此文件夹内）</label>
+          <div style="display:flex;gap:16px;margin:4px 0 8px;flex-wrap:wrap">
+            <label style="display:flex;align-items:center;gap:4px"><input type="radio" name="taskWsMode" value="new"> 新建文件夹</label>
+            <label style="display:flex;align-items:center;gap:4px"><input type="radio" name="taskWsMode" value="pick"> 选择本地文件夹</label>
+            <label style="display:flex;align-items:center;gap:4px"><input type="radio" name="taskWsMode" value="inherit"> 继承项目工作区</label>
+          </div>
+          <input id="taskDir" type="text" placeholder="文件夹名或绝对路径，如 mytask 或 D:\work\mytask">
+          <div id="taskWsHint" style="color:#9aa0a6;font-size:12px;margin-top:4px"></div>
+          <div id="taskWsPickRow" class="hidden" style="margin-top:6px">
+            <input type="file" id="taskDirPicker" webkitdirectory directory multiple style="display:none">
+            <button type="button" class="btn" onclick="document.getElementById('taskDirPicker').click()">浏览本机文件夹…</button>
+            <span style="color:#9aa0a6;font-size:12px">浏览器安全限制：只能取文件夹名（建在服务端工作区内），绝对路径请用上方输入框粘贴</span>
+          </div>
         </div>
         <div class="form-actions">
           <button class="btn-primary" onclick="confirmCreateTask()">创建</button>

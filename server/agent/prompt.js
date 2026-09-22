@@ -8,14 +8,16 @@
  * 4. 工具结果裁剪上限从 2000 → 1500 字符，进一步省 token
  */
 
+import { describeScope } from './tool-router.js'
+
 /**
  * 构建消息数组
  */
-export function buildPrompt({ history, tools, skills, config, workDir, skillContext, plan, selfVerifyHint }) {
+export function buildPrompt({ history, tools, skills, config, workDir, skillContext, plan, selfVerifyHint, toolScope }) {
   const messages = []
 
   // 1. 系统提示词
-  const systemPrompt = buildSystemPrompt(tools, skills, config, workDir, skillContext, plan, selfVerifyHint)
+  const systemPrompt = buildSystemPrompt(tools, skills, config, workDir, skillContext, plan, selfVerifyHint, toolScope)
   messages.push({ role: 'system', content: systemPrompt })
 
   // 2. 对话历史（已裁剪，保序）
@@ -30,7 +32,7 @@ export function buildPrompt({ history, tools, skills, config, workDir, skillCont
 /**
  * 构建系统提示词
  */
-function buildSystemPrompt(tools, skills, config, workDir, skillContext, plan, selfVerifyHint) {
+function buildSystemPrompt(tools, skills, config, workDir, skillContext, plan, selfVerifyHint, toolScope) {
   const parts = []
 
   // 角色定义
@@ -41,15 +43,23 @@ function buildSystemPrompt(tools, skills, config, workDir, skillContext, plan, s
     parts.push(`## 工作目录\n当前工作目录是「${workDir}」。所有文件路径都相对此目录。若需操作其他项目，先用 list_files 确认。`)
   }
 
+  // 行为边界（防过度自主：一句问候不该引发命令狂奔）
+  parts.push(`## 行为边界（避免过度自主）
+- 当用户只是打招呼、闲聊、寒暄（如「你好」「在吗」「你是谁」），或纯粹表达情绪时，直接用自然语言友好回复，**不要调用任何工具**：不要去检查服务状态、不要启动/重启服务、不要执行任何命令、不要主动「验证环境健康」、不要跑测试或蜂群任务。
+- 只有当用户提出明确的、与文件 / 命令执行 / 代码 / 数据 / 查询相关的**具体任务**时，才调用对应工具。
+- 用户没有明确要求时，不要主动探测健康、检查连接、启动服务。先确认需求再动手。
+- 能用一句话回答的，就不要动工具。调用工具前先想清楚是否真的需要。`)
+
   // 执行计划（规划前置：模型按步骤推进，提升多步任务稳定性）
   if (plan) {
     parts.push(`## 执行计划\n${plan}\n请严格按步骤逐步执行，每完成一步再继续，不要跳步。`)
   }
 
-  // 工具列表（完整 schema 注入，含 MCP 工具）
+  // 工具列表（动态子集注入：只给当前任务相关的工具，省 token + 降选择过载）
   if (tools && tools.length > 0) {
     const toolDesc = tools.map(t => describeTool(t)).join('\n\n')
     parts.push(`## 可用工具\n${toolDesc}`)
+    if (toolScope) parts.push(describeScope(toolScope, toolScope.allCount))
   }
 
   // 输出格式（严格要求）
@@ -77,6 +87,19 @@ function buildSystemPrompt(tools, skills, config, workDir, skillContext, plan, s
     parts.push(skillContext)
   } else if (skills && skills.length > 0) {
     parts.push(`## 技能\n${skills.map(s => `- ${s.name}: ${s.description}`).join('\n')}`)
+  }
+
+  // Windows 命令行注意事项（项目仅运行在 Windows 上）
+  if (process.platform === 'win32') {
+    parts.push(`## Windows 命令行注意事项
+- 本服务运行在 Windows 上，run_command 的命令经 cmd.exe 执行。
+- 终止进程**不要**用 kill（Windows 没有该命令）。正确做法：\`taskkill /PID <pid> /F /T\`（/T 杀进程树），或用 PowerShell：\`powershell -Command "Stop-Process -Id <pid> -Force"\`。
+- 等待延时**不要**用 sleep，用：\`timeout /t 3 /nobreak\`。
+- 文本查找用 findstr（不是 grep），例如 \`netstat -ano | findstr :3000\`。
+- curl 可用（Windows 10+ 自带 curl.exe）；若提示找不到 curl，改写 curl.exe。
+- 不要用 Linux 的 rm / ls / chmod / cat，改用 del / dir 等；列目录用 \`dir\`。
+- 运行生成的可执行文件直接用程序名（如 \`hello\`），不要写 \`./hello\`。
+- 一次命令里若需多条语句，用 \`&&\` 或 \`&\` 连接，不要依赖 Linux 的分号行为歧义。`)
   }
 
   // 只读模式提示：明确约束模型只调用查询类工具（权限模式开关的一部分）

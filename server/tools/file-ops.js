@@ -1,5 +1,9 @@
 /**
  * File Operations Tools - 文件操作工具集（带路径安全防护）
+ *
+ * 工作目录（沙箱根）随当前激活项目动态变化：每次工具执行时通过 getBaseDir()
+ * 取当前项目 dir，并重新构造 PathGuard。这样"在新建项目时选择本地文件夹当工作区"
+ * 能真正生效——agent 的文件读写被限制在所选工作区内。
  */
 
 import fs from 'fs/promises'
@@ -10,13 +14,15 @@ import { checkFileOp } from './safety-gate.js'
 const MAX_READ_BYTES = 2 * 1024 * 1024   // 单次读取上限 2MB
 const MAX_WRITE_BYTES = 5 * 1024 * 1024  // 单次写入上限 5MB
 
-export function registerFileOps(registry, { baseDir, getPermissionMode } = {}) {
-  const guard = new PathGuard(baseDir)
+export function registerFileOps(registry, { getBaseDir, getPermissionMode } = {}) {
   // 实时读取权限模式（支持模型切换后动态生效）：unattended 跳过 delete_file 二次确认
   const getMode = () => (getPermissionMode && getPermissionMode()) || 'guarded'  // guarded | read-only | unattended
 
-  // 相对路径显示，方便模型理解
-  const rel = (abs) => path.relative(baseDir, abs) || '.'
+  // 每次执行重新构造守卫：工作目录可能随项目切换而变化
+  const getCtx = () => {
+    const bd = getBaseDir()
+    return { guard: new PathGuard(bd), baseDir: bd, rel: (abs) => path.relative(bd, abs) || '.' }
+  }
 
   // ── 列出目录 ────────────────────────────────────────────────
   registry.register({
@@ -29,6 +35,7 @@ export function registerFileOps(registry, { baseDir, getPermissionMode } = {}) {
       },
     },
     async execute({ dir }) {
+      const { guard } = getCtx()
       const target = await guard.resolveChecked(dir || '.', { mustExist: true, allowFile: false })
       const entries = await fs.readdir(target, { withFileTypes: true })
       return entries.map(e => ({
@@ -52,6 +59,7 @@ export function registerFileOps(registry, { baseDir, getPermissionMode } = {}) {
       required: ['path'],
     },
     async execute({ path: filePath, offset, limit }) {
+      const { guard } = getCtx()
       const target = await guard.resolveChecked(filePath, { allowDir: false })
       const stat = await fs.stat(target)
       if (stat.size > MAX_READ_BYTES) {
@@ -85,6 +93,7 @@ export function registerFileOps(registry, { baseDir, getPermissionMode } = {}) {
     async execute({ path: filePath, content }) {
       const deny = checkFileOp('write_file', { path: filePath })
       if (deny) return { error: '安全拦截：' + deny, needConfirm: true, code: 'DENIED' }
+      const { guard, rel } = getCtx()
       const target = guard.resolve(filePath)
       if (typeof content !== 'string') throw new Error('content 必须是字符串')
       if (content.length > MAX_WRITE_BYTES) {
@@ -111,6 +120,7 @@ export function registerFileOps(registry, { baseDir, getPermissionMode } = {}) {
     async execute({ path: filePath, content }) {
       const deny = checkFileOp('append_file', { path: filePath })
       if (deny) return { error: '安全拦截：' + deny, needConfirm: true, code: 'DENIED' }
+      const { guard, rel } = getCtx()
       const target = guard.resolve(filePath)
       await fs.mkdir(path.dirname(target), { recursive: true })
       await fs.appendFile(target, content, 'utf-8')
@@ -133,6 +143,7 @@ export function registerFileOps(registry, { baseDir, getPermissionMode } = {}) {
     async execute({ path: filePath, confirm }) {
       const deny = checkFileOp('delete_file', { path: filePath })
       if (deny) return { error: '安全拦截：' + deny, needConfirm: true, code: 'DENIED' }
+      const { guard, rel } = getCtx()
       // unattended 模式（无人值守）下跳过二次确认，但受保护路径拦截仍然生效
       if (getMode() !== 'unattended' && confirm !== true) {
         return { error: '删除是危险操作，已拦截。请在 arguments 中显式传入 "confirm": true 以确认执行。', needConfirm: true }
@@ -149,6 +160,7 @@ export function registerFileOps(registry, { baseDir, getPermissionMode } = {}) {
     description: '创建目录（支持多级）',
     parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
     async execute({ path: dirPath }) {
+      const { guard, rel } = getCtx()
       const target = guard.resolve(dirPath)
       await fs.mkdir(target, { recursive: true })
       return { success: true, created: rel(target) }
@@ -170,6 +182,7 @@ export function registerFileOps(registry, { baseDir, getPermissionMode } = {}) {
     async execute({ from, to }) {
       const deny = checkFileOp('move_file', { from, to })
       if (deny) return { error: '安全拦截：' + deny, needConfirm: true, code: 'DENIED' }
+      const { guard, rel } = getCtx()
       const src = await guard.resolveChecked(from)
       const dst = guard.resolve(to)
       if (dst === src) return { success: true, from: rel(src), to: rel(dst), note: '源目标相同' }
@@ -199,6 +212,7 @@ export function registerFileOps(registry, { baseDir, getPermissionMode } = {}) {
     async execute({ from, to }) {
       const deny = checkFileOp('copy_file', { from, to })
       if (deny) return { error: '安全拦截：' + deny, needConfirm: true, code: 'DENIED' }
+      const { guard, rel } = getCtx()
       const src = await guard.resolveChecked(from, { allowDir: false })
       const dst = guard.resolve(to)
       await fs.mkdir(path.dirname(dst), { recursive: true })
@@ -219,6 +233,7 @@ export function registerFileOps(registry, { baseDir, getPermissionMode } = {}) {
       required: ['path'],
     },
     async execute({ path: filePath }) {
+      const { guard, rel, baseDir } = getCtx()
       const target = await guard.resolveChecked(filePath)
       const stat = await fs.stat(target)
       return {
@@ -228,6 +243,7 @@ export function registerFileOps(registry, { baseDir, getPermissionMode } = {}) {
         isFile: stat.isFile(),
         isDirectory: stat.isDirectory(),
         modified: stat.mtime.toISOString(),
+        workDir: baseDir,
       }
     },
   })
@@ -245,6 +261,7 @@ export function registerFileOps(registry, { baseDir, getPermissionMode } = {}) {
       required: ['pattern'],
     },
     async execute({ pattern, dir }) {
+      const { guard, baseDir } = getCtx()
       const target = await guard.resolveChecked(dir || '.', { allowFile: false })
       const SKIP = new Set(['node_modules', '.git', 'dist', 'build', '__pycache__', 'venv', '.venv'])
       const results = []

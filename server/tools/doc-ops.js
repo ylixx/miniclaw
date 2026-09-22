@@ -1,16 +1,19 @@
 /**
  * Office Document Tools - 办公文档处理工具
- * 
- * 基于纯 JS 实现，不依赖 native 库，适合小模型轻量部署
+ *
+ * 基于纯 JS 实现，不依赖 native 库，适合小模型轻量部署。
+ * 工作目录随当前项目动态变化（每次执行通过 getBaseDir 取沙箱根）。
  */
 
 import fs from 'fs/promises'
 import path from 'path'
 import { PathGuard } from './path-guard.js'
 
-export function registerDocOps(registry, { baseDir }) {
-  const guard = new PathGuard(baseDir)
-  const rel = (abs) => path.relative(baseDir, abs) || '.'
+export function registerDocOps(registry, { getBaseDir } = {}) {
+  const getCtx = () => {
+    const bd = getBaseDir()
+    return { guard: new PathGuard(bd), baseDir: bd, rel: (abs) => path.relative(bd, abs) || '.' }
+  }
 
   // ── 读取 CSV ────────────────────────────────────────────────
   registry.register({
@@ -25,6 +28,7 @@ export function registerDocOps(registry, { baseDir }) {
       required: ['path'],
     },
     async execute({ path: filePath, limit }) {
+      const { guard } = getCtx()
       const target = await guard.resolveChecked(filePath, { allowDir: false })
       const content = await fs.readFile(target, 'utf-8')
       const lines = content.split(/\r?\n/).filter(l => l.trim())
@@ -55,7 +59,8 @@ export function registerDocOps(registry, { baseDir }) {
       required: ['path', 'headers', 'rows'],
     },
     async execute({ path: filePath, headers, rows }) {
-      const target = path.resolve(baseDir, filePath)
+      const { guard, rel, baseDir } = getCtx()
+      const target = guard.resolve(filePath)
       const lines = [headers.join(',')]
       for (const row of rows) {
         if (Array.isArray(row)) {
@@ -81,6 +86,7 @@ export function registerDocOps(registry, { baseDir }) {
       required: ['path'],
     },
     async execute({ path: filePath }) {
+      const { guard } = getCtx()
       const target = await guard.resolveChecked(filePath, { allowDir: false })
       const content = await fs.readFile(target, 'utf-8')
       return JSON.parse(content)
@@ -101,6 +107,7 @@ export function registerDocOps(registry, { baseDir }) {
       required: ['path', 'data'],
     },
     async execute({ path: filePath, data, pretty }) {
+      const { guard, rel } = getCtx()
       const target = guard.resolve(filePath)
       const content = pretty !== false ? JSON.stringify(data, null, 2) : JSON.stringify(data)
       await fs.writeFile(target, content, 'utf-8')
@@ -148,7 +155,7 @@ export function registerDocOps(registry, { baseDir }) {
         characters: text.length,
         words: text.split(/\s+/).filter(w => w).length,
         lines: text.split('\n').length,
-        chinese: (text.match(/[\u4e00-\u9fff]/g) || []).length,
+        chinese: (text.match(/[一-鿿]/g) || []).length,
       }
     },
   })
@@ -167,6 +174,7 @@ export function registerDocOps(registry, { baseDir }) {
       required: ['path', 'find', 'replace'],
     },
     async execute({ path: filePath, find, replace }) {
+      const { guard, rel } = getCtx()
       const target = await guard.resolveChecked(filePath, { allowDir: false })
       const content = await fs.readFile(target, 'utf-8')
       const count = content.split(find).length - 1
@@ -189,6 +197,7 @@ export function registerDocOps(registry, { baseDir }) {
       required: ['path'],
     },
     async execute({ path: filePath, lines: n }) {
+      const { guard } = getCtx()
       const target = await guard.resolveChecked(filePath, { allowDir: false })
       const content = await fs.readFile(target, 'utf-8')
       const allLines = content.split('\n')

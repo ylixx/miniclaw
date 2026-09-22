@@ -34,17 +34,34 @@ export class WorkspaceManager {
     } catch {
       this.projects = []
     }
-    // 首次运行：创建默认项目
+    // 首次运行：创建默认项目（工作区指向仓库内的 workspace/ 子文件夹，避免产物污染源码根）
     if (this.projects.length === 0) {
       this.projects.push({
         id: 'default',
         name: '默认项目',
-        dir: '.',
+        dir: path.join(this.baseDir, 'workspace'),
         createdAt: new Date().toISOString(),
         tasks: [],
       })
       await this.save()
+    } else {
+      // 归一化历史数据：dir 统一解析为绝对路径（兼容旧数据存 '.' 或相对值）
+      const defaultWs = path.join(this.baseDir, 'workspace')
+      let changed = false
+      for (const p of this.projects) {
+        const abs = path.resolve(this.baseDir, p.dir || '.')
+        // 把仍指向仓库根的「默认项目」迁移到 workspace 子文件夹（防止产物落在源码根）
+        if (p.id === 'default' && abs === this.baseDir) {
+          p.dir = defaultWs
+          changed = true
+          continue
+        }
+        if (abs !== p.dir) { p.dir = abs; changed = true }
+      }
+      if (changed) await this.save()
     }
+    // 确保工作区目录存在（list/write 需在目录存在时才正常）
+    await fs.mkdir(path.join(this.baseDir, 'workspace'), { recursive: true })
   }
 
   // ── 持久化（串行化写入，防并发损坏）────────────────────────
@@ -79,14 +96,37 @@ export class WorkspaceManager {
     return this.projects.find(p => p.id === id)
   }
 
+  /**
+   * 解析并准备项目目录（工作区）：
+   * - 相对路径以 baseDir 为根解析为绝对路径
+   * - 目录不存在则自动创建（新建文件夹模式）
+   * - 已存在但不是目录则报错（选择本地文件夹模式校验）
+   */
+  async _resolveDir(dir) {
+    const raw = (dir && typeof dir === 'string' && dir.trim()) ? dir.trim() : '.'
+    const abs = path.resolve(this.baseDir, raw)
+    try {
+      const st = await fs.stat(abs)
+      if (!st.isDirectory()) throw new Error(`路径不是目录，无法作为工作区: ${abs}`)
+      return abs
+    } catch (e) {
+      if (e.code === 'ENOENT') {
+        await fs.mkdir(abs, { recursive: true })
+        return abs
+      }
+      throw e
+    }
+  }
+
   async createProject({ name, dir = '.' }) {
     if (!name || !name.trim()) throw new Error('项目名必填')
     if (this.projects.length >= 50) throw new Error('项目数量已达上限')
+    const absDir = await this._resolveDir(dir)
     const id = `proj_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
     this.projects.push({
       id,
       name: name.trim().slice(0, MAX_TITLE_LEN),
-      dir,
+      dir: absDir,
       createdAt: new Date().toISOString(),
       tasks: [],
     })
@@ -98,7 +138,7 @@ export class WorkspaceManager {
     const p = this.getProject(id)
     if (!p) throw new Error(`项目不存在: ${id}`)
     if (name !== undefined) p.name = String(name).trim().slice(0, MAX_TITLE_LEN) || p.name
-    if (dir !== undefined) p.dir = dir
+    if (dir !== undefined) p.dir = await this._resolveDir(dir)
     await this.save()
     return p
   }
@@ -124,16 +164,24 @@ export class WorkspaceManager {
     return null
   }
 
-  async createTask(projectId, { title } = {}) {
+  async createTask(projectId, { title, dir } = {}) {
     const p = this.getProject(projectId)
     if (!p) throw new Error(`项目不存在: ${projectId}`)
     if (p.tasks.length >= MAX_TASKS_PER_PROJECT) throw new Error('该项目任务数已达上限')
+
+    // 任务级工作区（可选）：用户可在新建任务时新建文件夹或选择本地文件夹。
+    // 未指定时 task.dir 为 undefined，getActiveDir 会回退到项目工作区（向后兼容）。
+    let taskDir = undefined
+    if (dir && typeof dir === 'string' && dir.trim()) {
+      taskDir = await this._resolveDir(dir.trim())
+    }
 
     const id = `task_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
     const task = {
       id,
       title: (title || '新任务').trim().slice(0, MAX_TITLE_LEN),
       projectId,
+      dir: taskDir,     // 任务专属工作区（绝对路径）；undefined = 继承项目工作区
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       messages: [],     // 完整对话历史（含 tool 调用）
@@ -177,6 +225,25 @@ export class WorkspaceManager {
     await this.save()
   }
 
+  /**
+   * 返回当前激活任务所属项目的绝对工作目录。
+   * 无激活任务时返回首个项目目录，兜底 baseDir。
+   * 供文件/命令工具的 PathGuard 动态作为沙箱根（让"选本地文件夹当工作区"真正生效）。
+   */
+  getActiveDir() {
+    if (this.activeTaskId) {
+      const found = this.findTask(this.activeTaskId)
+      if (found) {
+        // 任务级工作区优先；未设置则回退到项目工作区
+        const td = found.task.dir
+        if (td) return path.resolve(this.baseDir, td)
+        return path.resolve(this.baseDir, found.project.dir)
+      }
+    }
+    if (this.projects.length) return path.resolve(this.baseDir, this.projects[0].dir)
+    return this.baseDir
+  }
+
   getActiveTask() {
     if (!this.activeTaskId) return null
     return this.findTask(this.activeTaskId)?.task || null
@@ -198,6 +265,7 @@ export class WorkspaceManager {
       id: t.id,
       title: t.title,
       projectId: t.projectId,
+      dir: t.dir || p.dir,   // 任务有效工作区（任务级优先，否则项目级）
       createdAt: t.createdAt,
       updatedAt: t.updatedAt,
       messageCount: (t.messages || []).length,

@@ -53,13 +53,31 @@ npm start
 | `WORK_DIR` | 当前目录 | 工作目录 |
 | `CONFIG_DIR` | ~/.miniagent | 配置目录 |
 
-## 内置工具
+## 内置工具（共 36 个）
 
-文件操作: list_files, read_file, write_file, append_file, delete_file, create_dir, move_file, copy_file, file_info, search_files
+| 分组 | 工具 |
+|------|------|
+| 基础文件 | list_files, read_file, write_file, search_files, create_dir, move_file |
+| 文件管理 | file_info, copy_file, append_file, delete_file |
+| 命令执行 | run_command |
+| 数据处理 | read_csv, write_csv, read_json, write_json, md_table, text_stats, text_replace, text_summary |
+| Word | create_docx, read_docx, docx_to_markdown, replace_docx_text |
+| Excel | create_xlsx, read_xlsx, xlsx_to_csv, xlsx_to_markdown |
+| PPT | create_pptx, read_pptx, pptx_to_markdown, replace_pptx_text, append_pptx_slide |
+| PDF | create_pdf, read_pdf, merge_pdf, split_pdf |
 
-数据处理: read_csv, write_csv, read_json, write_json, md_table
+## 工具动态注入（4B 小模型减负）
 
-文本处理: text_stats, text_replace, text_summary
+36 个工具的完整 schema 常驻 system prompt 会吃掉约 4000 token，且候选过多会让小模型选错工具。
+因此每次请求**只注入与当前任务相关的 6-14 个工具**（`server/agent/tool-router.js`）：
+
+- **A 技能路由**：激活技能时，注入其步骤所需工具 + 技能对应分组（上限 18）
+- **B 意图路由**：无技能时按用户消息关键词判定任务类型（pdf / pptx / xlsx / docx / data / file / command）
+- **兜底**：只注入 core 最小闭环（6 个）
+- **逃生舱**：模型若调用了子集外但确实存在的工具，引擎自动扩容放行，不会因裁剪而卡死
+- **只读模式**：进一步收敛为只读白名单
+
+实测 system prompt 从 4093 token 降到 1394-2086 token（省 49%-66%）。
 
 ## 项目结构
 
@@ -70,13 +88,20 @@ miniagent/
 │   ├── agent/
 │   │   ├── engine.js      # Agent 引擎（任务历史持久化）
 │   │   ├── prompt.js      # Prompt 构建器（技能指令/工作目录注入）
+│   │   ├── tool-router.js # 工具子集动态注入（4B 减负）
 │   │   ├── parser.js      # 响应解析器
 │   │   └── context.js     # 上下文管理（保序裁剪）
 │   ├── tools/
-│   │   ├── registry.js    # 工具注册表（内置 + MCP 合并）
+│   │   ├── registry.js    # 工具注册表（内置 + MCP 合并、模糊纠名）
 │   │   ├── path-guard.js  # 路径安全防护（防目录穿越）
+│   │   ├── safety-gate.js # 权限模式 / 危险命令闸门
 │   │   ├── file-ops.js    # 文件操作
-│   │   └── doc-ops.js     # 文档处理
+│   │   ├── doc-ops.js     # 数据处理 / 文本处理
+│   │   ├── docx-ops.js    # Word 读写
+│   │   ├── xlsx-ops.js    # Excel 读写
+│   │   ├── pptx-ops.js    # PPT 读写
+│   │   ├── pdf-ops.js     # PDF 生成/读取/合并/拆分
+│   │   └── shell.js       # 命令执行
 │   ├── models/
 │   │   └── manager.js     # 多模型管理
 │   ├── mcp/
