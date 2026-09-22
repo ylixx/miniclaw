@@ -18,9 +18,11 @@ const CONFIG_FILE = 'models.json'
 const PROVIDER_TEMPLATES = {
   agnes: {
     name: 'Agnes AI',
-    baseURL: 'https://api.agnes-ai.cn/v1',
+    baseURL: 'https://apihub.agnes-ai.cn/v1',
+    apiKey: '',
     api: 'openai-completions',
-    description: 'Agnes AI API',
+    model: 'agnes-2.5-flash',
+    description: 'Agnes AI（中国节点 apihub.agnes-ai.cn；国际 apihub.agnes-ai.com，同一 Key 通用）。文本/多模态用 agnes-2.5-flash，图像生成用 agnes-image-2.5-flash',
   },
   ollama: {
     name: 'Ollama (本地)',

@@ -24,6 +24,7 @@ import { SkillsManager } from './skills/loader.js'
 import { installSkillFromZip } from './skills/install.js'
 import { ModelManager } from './models/manager.js'
 import { WorkspaceManager } from './workspace/manager.js'
+import { analyzeImage, generateImage } from './agnes.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PORT = process.env.PORT || 3000
@@ -92,7 +93,8 @@ async function syncMCPTools() {
 
 const app = express()
 app.use(cors())
-app.use(express.json({ limit: '10mb' }))
+// 体积上限放宽到 32mb，以容纳本地图片经 base64 内联上传（图像分析/图生图场景）
+app.use(express.json({ limit: '32mb' }))
 // 前端为开发期静态资源，强制 no-store，避免浏览器缓存旧 app.js/styles.css 导致 UI 改动不生效
 app.use(express.static(path.join(__dirname, '../web'), {
   maxAge: 0,
@@ -330,6 +332,89 @@ app.post('/api/models/fetch', async (req, res) => {
   const result = await modelManager.fetchModels(baseURL, apiKey)
   res.json(result)
 })
+
+// ── Agnes 多模态 API ──────────────────────────────────────
+// 图像分析与图像生成复用"已配置的 Agnes 模型"的 baseURL / API Key；
+// 请求体也可携带 baseURL / apiKey / model 覆盖（便于临时切换节点或模型）。
+
+/**
+ * 解析 Agnes 配置：优先用请求体覆盖，否则回退到当前激活模型。
+ * @param {object} body
+ * @param {object} [fallback] 额外默认（如图像生成的默认模型名）
+ */
+function resolveAgnesConfig(body = {}, fallback = {}) {
+  const active = modelManager.getActive() || {}
+  const cfg = {
+    baseURL: body.baseURL || active.baseURL || '',
+    apiKey: body.apiKey || active.apiKey || '***',
+    model: body.model || fallback.model || active.model || '',
+  }
+  if (!cfg.baseURL) {
+    throw new Error('未配置 Agnes 模型：请先在「🧠 模型」中添加 Agnes（apihub.agnes-ai.cn）并填入 API Key，或在请求中提供 baseURL / apiKey。')
+  }
+  return cfg
+}
+
+// 图像分析（视觉理解）：agnes-2.5-flash 多模态 chat，返回文本
+app.post('/api/vision/analyze', async (req, res) => {
+  const { image, prompt, system, maxTokens, temperature, model } = req.body || {}
+  if (!image) return res.status(400).json({ error: 'image 必填（URL / dataURI / {data,mime}）' })
+  try {
+    const cfg = resolveAgnesConfig(req.body, { model: 'agnes-2.5-flash' })
+    const result = await analyzeImage({
+      baseURL: cfg.baseURL,
+      apiKey: cfg.apiKey,
+      model: model || cfg.model || 'agnes-2.5-flash',
+      image,
+      prompt,
+      system,
+      maxTokens: maxTokens ? Number(maxTokens) : 1024,
+      temperature: temperature != null ? Number(temperature) : 0.4,
+    })
+    res.json({ success: true, ...result })
+  } catch (err) {
+    const msg = (err.message || '').toLowerCase()
+    const isNet = /fetch failed|econnrefused|enotfound|etimedout|err_ssl|ssl|certificate|getaddrinfo|network/i.test(msg)
+    if (isNet) {
+      res.status(502).json({ error: `Agnes 端点不可达：${err.message}（检查 baseURL、网络、API Key）` })
+    } else {
+      res.status(500).json({ error: err.message })
+    }
+  }
+})
+
+// 图像生成/编辑：agnes-image-2.5-flash，文生图或图生图
+app.post('/api/image/generate', async (req, res) => {
+  const { prompt, image, size, ratio, returnBase64 } = req.body || {}
+  if (!prompt || !prompt.trim()) return res.status(400).json({ error: 'prompt 必填' })
+  try {
+    const cfg = resolveAgnesConfig(req.body, { model: 'agnes-image-2.5-flash' })
+    const result = await generateImage({
+      baseURL: cfg.baseURL,
+      apiKey: cfg.apiKey,
+      model: model_safe(req.body?.model) || 'agnes-image-2.5-flash',
+      prompt,
+      image,
+      size: size || '1024x768',
+      ratio,
+      returnBase64: !!returnBase64,
+    })
+    res.json({ success: true, ...result })
+  } catch (err) {
+    const msg = (err.message || '').toLowerCase()
+    const isNet = /fetch failed|econnrefused|enotfound|etimedout|err_ssl|ssl|certificate|getaddrinfo|network/i.test(msg)
+    if (isNet) {
+      res.status(502).json({ error: `Agnes 端点不可达：${err.message}（检查 baseURL、网络、API Key）` })
+    } else {
+      res.status(500).json({ error: err.message })
+    }
+  }
+})
+
+// 安全取 model：仅当显式传入非空字符串时使用，否则用默认图像模型名（避免误用文本模型名调图像端点）
+function model_safe(m) {
+  return typeof m === 'string' && m.trim() ? m.trim() : null
+}
 
 // ── 工具 / Skills API ─────────────────────────────────────────
 

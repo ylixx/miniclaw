@@ -415,3 +415,55 @@ body {
 .tok-string { color: #34d399; }
 .tok-num { color: #fbbf24; }
 .tok-key { color: #38bdf8; }
+
+/* ── Agnes 图像弹窗 ────────────────────────────────────── */
+
+.agnes-tabs { display: flex; gap: 8px; margin-bottom: 18px; }
+.agnes-tab {
+  flex: 1; background: var(--bg-elev); border: 1px solid var(--border);
+  color: var(--text-secondary); padding: 10px; border-radius: 8px; cursor: pointer;
+  font-size: 13px; transition: all 0.15s;
+}
+.agnes-tab:hover { color: var(--text-primary); }
+.agnes-tab.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+
+.agnes-panel { animation: fadeIn 0.2s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+.upload-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.upload-label {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+  background: var(--bg-elev); color: var(--text-primary); border: 1px solid var(--border);
+  padding: 8px 14px; border-radius: 6px; font-size: 13px;
+}
+.upload-label:hover { border-color: var(--accent); color: var(--accent); }
+.upload-name { font-size: 12px; color: var(--text-secondary); }
+
+.img-preview { margin-top: 12px; }
+.img-preview img {
+  max-width: 100%; max-height: 220px; border-radius: 8px; border: 1px solid var(--border);
+  display: block;
+}
+.img-preview .preview-cap { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+
+/* 分析结果卡片（对话区内） */
+.message.img-analysis {
+  background: var(--bg-elev); border: 1px solid var(--border-strong);
+  border-radius: 14px 14px 14px 4px; max-width: 90%; padding: 12px 14px;
+}
+.message.img-analysis .ia-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.message.img-analysis .ia-thumb {
+  width: 56px; height: 56px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); flex-shrink: 0;
+}
+.message.img-analysis .ia-q { font-size: 13px; color: var(--text-secondary); }
+.message.img-analysis .ia-q b { color: var(--text-primary); }
+.message.img-analysis .ia-text { line-height: 1.7; }
+
+/* 生成结果 */
+.gen-result { margin-top: 16px; }
+.gen-result img {
+  max-width: 100%; border-radius: 10px; border: 1px solid var(--border);
+  display: block; background: #0b0e13;
+}
+.gen-result .gen-cap { font-size: 12px; color: var(--text-secondary); margin-top: 8px; line-height: 1.5; }
+.gen-result a { color: var(--accent-2); word-break: break-all; }

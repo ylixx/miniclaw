@@ -516,6 +516,7 @@ function onProviderChange() {
     moonshot: { baseURL: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k' },
     zhipu: { baseURL: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4-flash' },
     openai: { baseURL: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+    agnes: { baseURL: 'https://apihub.agnes-ai.cn/v1', model: 'agnes-2.5-flash', apiKey: '' },
     custom: { baseURL: '', model: '' },
   }
   const t = templates[provider] || templates.custom
@@ -1052,6 +1053,9 @@ function setupEventListeners() {
       if (e.target === m) m.classList.add('hidden')
     })
   })
+
+  // Agnes 图像：本地图片上传绑定
+  _bindAgnesFileInputs()
 }
 
 // ── WebSocket ─────────────────────────────────────────────
@@ -1228,6 +1232,175 @@ function setupWebSocket() {
   ws.onclose = () => setTimeout(setupWebSocket, 3000)
 }
 
+// ── Agnes 图像（分析 / 生成）────────────────────────────
+
+let _anDataUrl = null   // 分析：本地上传图片的 dataURL
+let _gnDataUrl = null   // 生成：本地参考图 dataURL
+
+function openAgnesModal() {
+  $('#agnesModal').classList.remove('hidden')
+  switchAgnesTab('analyze')
+}
+
+function switchAgnesTab(tab) {
+  document.querySelectorAll('.agnes-tab').forEach(t => {
+    const isAnalyze = tab === 'analyze'
+    const hit = isAnalyze ? t.textContent.includes('分析') : t.textContent.includes('生成')
+    t.classList.toggle('active', hit)
+  })
+  $('#agnesAnalyze').classList.toggle('hidden', tab !== 'analyze')
+  $('#agnesGenerate').classList.toggle('hidden', tab !== 'generate')
+}
+
+function _bindAgnesFileInputs() {
+  const anFile = document.getElementById('anImageFile')
+  if (anFile) anFile.addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0]
+    if (!f) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      _anDataUrl = reader.result
+      const nameEl = document.getElementById('anImageName')
+      if (nameEl) nameEl.textContent = f.name
+      renderAnPreview(_anDataUrl)
+    }
+    reader.readAsDataURL(f)
+  })
+  const gnFile = document.getElementById('gnImageFile')
+  if (gnFile) gnFile.addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0]
+    if (!f) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      _gnDataUrl = reader.result
+      const nameEl = document.getElementById('gnImageName')
+      if (nameEl) nameEl.textContent = f.name
+    }
+    reader.readAsDataURL(f)
+  })
+}
+
+function renderAnPreview(src) {
+  const box = document.getElementById('anPreview')
+  if (!box) return
+  box.classList.remove('hidden')
+  box.innerHTML = `<img src="${src}" alt="预览"><div class="preview-cap">本地预览（上传后将转 base64 内联发送给 Agnes）</div>`
+}
+
+function showAnHint(type, msg) {
+  const el = document.getElementById('anAnalyzeHint')
+  if (!el) return
+  el.className = `test-result ${type}`
+  el.textContent = msg
+  el.classList.remove('hidden')
+}
+
+function showGnHint(type, msg) {
+  const el = document.getElementById('gnGenerateHint')
+  if (!el) return
+  el.className = `test-result ${type}`
+  el.textContent = msg
+  el.classList.remove('hidden')
+}
+
+async function runAnalyze() {
+  const url = document.getElementById('anImageUrl').value.trim()
+  const prompt = document.getElementById('anPrompt').value.trim() || '请详细描述这张图片的内容。'
+  const image = _anDataUrl || url   // 优先本地上传，其次 URL
+  if (!image) {
+    showAnHint('error', '请先填写图片 URL 或上传本地图片')
+    return
+  }
+  const btn = document.getElementById('anAnalyzeBtn')
+  if (btn) btn.disabled = true
+  showAnHint('', '分析中…')
+  try {
+    const res = await fetch(`${API}/api/vision/analyze`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image, prompt }),
+    })
+    const data = await res.json()
+    if (data.success) {
+      appendImageAnalysis(prompt, _anDataUrl || url, data.text)
+      showAnHint('success', `分析完成（model: ${data.model || 'agnes-2.5-flash'}）`)
+      setTimeout(() => closeModal('agnesModal'), 600)
+    } else {
+      showAnHint('error', `失败: ${data.error}`)
+    }
+  } catch (err) {
+    showAnHint('error', `请求失败: ${err.message}`)
+  } finally {
+    if (btn) btn.disabled = false
+  }
+}
+
+function appendImageAnalysis(prompt, imageSrc, text) {
+  const div = document.createElement('div')
+  div.className = 'message img-analysis'
+  div.innerHTML = `
+    <div class="ia-head">
+      <img class="ia-thumb" src="${escapeHtml(imageSrc)}" alt="分析图">
+      <div class="ia-q"><b>图像分析</b><br>${escapeHtml(prompt)}</div>
+    </div>
+    <div class="ia-text md-content">${renderMarkdown(text)}</div>`
+  chatMessages.appendChild(div)
+  chatMessages.scrollTop = chatMessages.scrollHeight
+}
+
+async function runGenerate() {
+  const prompt = document.getElementById('gnPrompt').value.trim()
+  if (!prompt) { showGnHint('error', '请填写生成指令'); return }
+  const url = document.getElementById('gnImageUrl').value.trim()
+  const image = _gnDataUrl || (url || undefined)   // 优先本地参考图，其次 URL
+  const size = document.getElementById('gnSize').value.trim() || '1024x768'
+  const ratio = document.getElementById('gnRatio').value.trim()
+  const format = document.getElementById('gnFormat').value  // 'url' | 'base64'
+  const btn = document.getElementById('gnGenerateBtn')
+  if (btn) btn.disabled = true
+  showGnHint('', '生成中…（免费档约 20 RPM，请稍候）')
+  try {
+    const res = await fetch(`${API}/api/image/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt,
+        image,
+        size,
+        ratio: ratio || undefined,
+        returnBase64: format === 'base64',
+      }),
+    })
+    const data = await res.json()
+    if (data.success) {
+      renderGenResult(data, prompt)
+      showGnHint('success', '生成完成')
+    } else {
+      showGnHint('error', `失败: ${data.error}`)
+    }
+  } catch (err) {
+    showGnHint('error', `请求失败: ${err.message}`)
+  } finally {
+    if (btn) btn.disabled = false
+  }
+}
+
+function renderGenResult(data, prompt) {
+  const box = document.getElementById('gnResult')
+  if (!box) return
+  box.classList.remove('hidden')
+  let inner = ''
+  if (data.url) {
+    inner = `<img src="${escapeHtml(data.url)}" alt="生成结果"><div class="gen-cap">${escapeHtml(prompt)}<br><a href="${escapeHtml(data.url)}" target="_blank" rel="noopener">打开原图</a></div>`
+  } else if (data.b64_json) {
+    inner = `<img src="data:image/png;base64,${data.b64_json}" alt="生成结果"><div class="gen-cap">${escapeHtml(prompt)}</div>`
+  } else {
+    inner = `<div class="gen-cap">未返回图片数据</div>`
+  }
+  if (data.revised_prompt) inner += `<div class="gen-cap">修订提示词：${escapeHtml(data.revised_prompt)}</div>`
+  box.innerHTML = inner
+}
+
 // ── 全局导出 ──────────────────────────────────────────────
 
 window.closeModal = closeModal
@@ -1265,5 +1438,9 @@ window.resetForm = resetForm
 window.editModel = editModel
 window.deleteModel = deleteModel
 window.activateModel = activateModel
+window.openAgnesModal = openAgnesModal
+window.switchAgnesTab = switchAgnesTab
+window.runAnalyze = runAnalyze
+window.runGenerate = runGenerate
 
 init()
