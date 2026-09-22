@@ -18,8 +18,10 @@ import { AgentEngine } from './agent/engine.js'
 import { ToolRegistry } from './tools/registry.js'
 import { registerFileOps } from './tools/file-ops.js'
 import { registerDocOps } from './tools/doc-ops.js'
+import { registerShell } from './tools/shell.js'
 import { MCPClient } from './mcp/client.js'
 import { SkillsManager } from './skills/loader.js'
+import { installSkillFromZip } from './skills/install.js'
 import { ModelManager } from './models/manager.js'
 import { WorkspaceManager } from './workspace/manager.js'
 
@@ -33,6 +35,7 @@ const CONFIG_DIR = process.env.CONFIG_DIR || path.join(process.env.HOME || proce
 const tools = new ToolRegistry()
 registerFileOps(tools, { baseDir: BASE_DIR, getPermissionMode: () => getModelConfig().permissionMode })
 registerDocOps(tools, { baseDir: BASE_DIR })
+registerShell(tools, { baseDir: BASE_DIR, getPermissionMode: () => getModelConfig().permissionMode })
 
 const mcp = new MCPClient(CONFIG_DIR, BASE_DIR)
 const skills = new SkillsManager(CONFIG_DIR)
@@ -90,7 +93,29 @@ async function syncMCPTools() {
 const app = express()
 app.use(cors())
 app.use(express.json({ limit: '10mb' }))
-app.use(express.static(path.join(__dirname, '../web')))
+// 前端为开发期静态资源，强制 no-store，避免浏览器缓存旧 app.js/styles.css 导致 UI 改动不生效
+app.use(express.static(path.join(__dirname, '../web'), {
+  maxAge: 0,
+  setHeaders(res) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate')
+    res.setHeader('Pragma', 'no-cache')
+    res.setHeader('Expires', '0')
+  },
+}))
+
+// ── 技能包（zip）一键安装 ────────────────────────────────
+// 接收 zip 原始字节，解包→识别 SKILL.md/JSON→写入 skills 目录→热重载
+app.post('/api/skills/install', express.raw({ type: 'application/zip', limit: '15mb' }), async (req, res) => {
+  try {
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return res.status(400).json({ error: '缺少 zip 数据' })
+    }
+    const result = await installSkillFromZip(req.body, skills)
+    res.json({ ok: true, skill: result })
+  } catch (err) {
+    res.status(400).json({ error: err.message || '安装失败' })
+  }
+})
 
 // ── 对话 API ───────────────────────────────────────────────────
 

@@ -53,12 +53,21 @@ function buildSystemPrompt(tools, skills, config, workDir, skillContext, plan, s
   }
 
   // 输出格式（严格要求）
-  parts.push(`## 输出规则
+  parts.push(`## 执行命令（运行/编译程序）
+- 当用户要求「运行 / 编译 / 执行某个文件或命令」时，使用 run_command 工具，不要只给文字说明。
+- 编译并运行 C++ 示例：\`g++ hello.cpp -o hello && hello\`（Windows 上运行生成的可执行文件直接用程序名 \`hello\`，会自动找 \`hello.exe\`，不要写 \`./hello\`）。
+- 运行脚本示例：\`python app.py\`、\`node app.js\`。
+- run_command 返回 stdout / stderr / exitCode；若 exitCode 非 0，先读 stderr 判断原因（如编译错误）再修正重试。
+- 危险命令（rm -rf /、curl|sh、sudo、git reset --hard 等）会被安全闸拒绝，不要尝试。
+
+## 输出规则
 - 要调用工具，只输出一个 JSON 代码块（不要包裹多余文字）：
 \`\`\`json
 {"tool":"工具名","arguments":{"参数1":"值1","参数2":"值2"}}
 \`\`\`
 - 不调用工具时，直接用自然语言回复，不要输出 JSON。
+- 回复中出现任何代码（源码、命令、文件路径、配置、示例）时，必须且只用 \`\`\` 围栏代码块包裹，并标注语言（如 \`\`\`python、\`\`\`bash、\`\`\`cpp），不要用行内反引号包裹整段代码，以便前端渲染代码块并提供一键复制。
+- 换行请用真实换行符，不要使用 HTML 的 <br> 标签。
 - 一次只调一个工具，不要并行调用多个。
 - 调用前先用 list_files / read_file 确认文件存在，避免路径错误。
 - 不要重复调用相同工具做相同的事。`)

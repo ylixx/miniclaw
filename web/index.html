@@ -142,9 +142,13 @@
         <h4>激活技能后，其指令将注入对话（按步骤引导执行）</h4>
         <div id="skillsFullList" class="models-list"></div>
       </div>
-      <div class="models-section">
-        <h4>自定义技能</h4>
-        <div class="model-form">
+    <div class="models-section">
+      <h4>自定义技能</h4>
+      <div class="model-form-actions" style="margin-bottom:12px">
+        <button class="btn-primary" id="btnInstallSkill" type="button">📦 安装 zip 技能包</button>
+        <input type="file" id="skillZipInput" accept=".zip" style="display:none">
+      </div>
+      <div class="model-form">
           <div class="form-row">
             <label>技能名称（英文标识）</label>
             <input id="skName" type="text" placeholder="my_skill">

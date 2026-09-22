@@ -107,6 +107,36 @@ export class SkillsManager {
     }
   }
 
+  /**
+   * 热重载：重新扫描 skills 目录（保留内置技能 + 当前激活状态），
+   * 供 zip 安装等场景在不重启服务的情况下生效。
+   */
+  async reload() {
+    this.skills = [...BUILTIN_SKILLS]
+    try {
+      const files = await fs.readdir(this.skillsDir)
+      for (const f of files) {
+        if (!f.endsWith('.json')) continue
+        try {
+          const data = JSON.parse(await fs.readFile(path.join(this.skillsDir, f), 'utf-8'))
+          if (data.name && data.instruction) {
+            this.skills.push({
+              name: data.name,
+              description: data.description || data.name,
+              instruction: data.instruction,
+              steps: data.steps || [],
+              params: data.params || [],
+              builtin: false,
+              file: f,
+            })
+          }
+        } catch { /* 跳过损坏的技能文件 */ }
+      }
+    } catch {
+      /* 目录不存在 */
+    }
+  }
+
   list() {
     return this.skills.map(s => ({
       name: s.name,

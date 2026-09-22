@@ -352,6 +352,40 @@ async function deleteSkill(name) {
   await loadSkillsFullList()
 }
 
+// 从 zip 包安装技能：读取文件 → 以原始字节 POST → 刷新列表
+function installSkillFromZipFile(file) {
+  const btn = document.getElementById('btnInstallSkill')
+  const orig = btn ? btn.textContent : '📦 安装 zip 技能包'
+  if (btn) { btn.disabled = true; btn.textContent = '安装中…' }
+  const reader = new FileReader()
+  reader.onload = async () => {
+    try {
+      const buf = new Uint8Array(reader.result)
+      const res = await fetch(`${API}/api/skills/install`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/zip' },
+        body: buf,
+      })
+      const data = await res.json()
+      if (data.ok) {
+        alert(`技能「${data.skill.name}」安装成功！可在上方列表激活。`)
+        await loadSkillsFullList()
+      } else {
+        alert('安装失败：' + (data.error || '未知错误'))
+      }
+    } catch (err) {
+      alert('安装出错：' + err.message)
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = orig }
+    }
+  }
+  reader.onerror = () => {
+    alert('读取文件失败')
+    if (btn) { btn.disabled = false; btn.textContent = orig }
+  }
+  reader.readAsArrayBuffer(file)
+}
+
 // ── MCP ───────────────────────────────────────────────────
 
 async function openMcpModal() {
@@ -838,8 +872,13 @@ function renderCodeBlock(code, lang) {
 }
 
 function inlineMd(text) {
+  // 整段若是被单个反引号包裹的多行代码 → 直接作为代码块（带复制按钮），避免被当行内代码压成一行
+  const whole = text.match(/^\s*`([\s\S]+?)`\s*$/)
+  if (whole && whole[1].includes('\n')) {
+    return renderCodeBlock(whole[1].trim(), detectLang(whole[1]))
+  }
   let s = escapeHtml(text)
-  s = s.replace(/`([^`]+)`/g, (_, c) => `<code class="inline">${c}</code>`)
+  s = s.replace(/`([^`\n]+)`/g, (_, c) => `<code class="inline">${c}</code>`)
   s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
   s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
   s = s.replace(/_([^_\n]+)_/g, '<em>$1</em>')
@@ -847,9 +886,44 @@ function inlineMd(text) {
   return s
 }
 
+// 粗略判断一段纯文本是否像源代码（用于把模型"裸输出"的代码也渲染成代码块）
+function looksLikeCode(text) {
+  const lines = text.split('\n')
+  if (lines.length < 3) {
+    // 单行/双行且以强代码特征开头（#include/import/def/class/...）→ 也视为代码块，避免裸奔
+    if (/^(#include|import\s|from\s|using\s|package\s|#!\/|def\s|class\s|public\s|private\s|protected\s|function\s|const\s|let\s|var\s|interface\s|enum\s|struct\s)/.test(text.trim())) return true
+    return false
+  }
+  // 含中文句子标点 → 视为正文，不当代码
+  if (/[。，！？、；：「」（）]/.test(text)) return false
+  const marker = /(#include|import\s|from\s|def\s|class\s|function\s|public\s|private\s|protected\s|void\s|int\s|const\s|let\s|var\s|return\s|=>|std::|console\.log|print\(|\bfn\s|package\s|using\s|namespace\s|;\s*$|\{\s*$|\}\s*$)/i
+  let hits = 0
+  for (const l of lines) if (marker.test(l)) hits++
+  return hits >= 2
+}
+
+// 根据代码特征推测语言（仅用于代码块角标，缺失则用 text）
+function detectLang(text) {
+  if (/#include|std::|int\s+main|cout|printf|std::endl/.test(text)) return 'cpp'
+  if (/\bdef\s|print\(|import\s+os\b|\bself\b|elif\s/.test(text)) return 'python'
+  if (/\bfunction\b|=>|console\.|const\s|let\s|var\s|document\./.test(text)) return 'javascript'
+  if (/\bpublic\s+class|System\.out|void\s+main/.test(text)) return 'java'
+  if (/#!\/|echo\s|sudo\s|\$\s|apt\b|yum\b/.test(text)) return 'bash'
+  if (/package\s+main|func\s+main|fmt\.|\bgo\b/.test(text)) return 'go'
+  if (/<\?php|<\?xml/.test(text)) return 'php'
+  return 'text'
+}
+
 function renderMarkdown(src) {
   if (!src) return ''
-  const lines = String(src).replace(/\r\n/g, '\n').split('\n')
+  // 还原模型可能直接吐出的 HTML 换行标签（agnes 等聊天模型常用 <br> 当换行），
+  // 否则 escapeHtml 后会被原样显示成文字。同时兼容已被转义的 &lt;br&gt;。
+  const normalized = String(src)
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/br>/gi, '\n')
+    .replace(/&lt;br\s*\/?&gt;/gi, '\n')
+    .replace(/&lt;\/br&gt;/gi, '\n')
+  const lines = normalized.replace(/\r\n/g, '\n').split('\n')
   let html = ''
   let inList = null
   let i = 0
@@ -882,9 +956,31 @@ function renderMarkdown(src) {
     if (ol) { if (inList !== 'ol') { closeList(); html += '<ol>'; inList = 'ol' } html += `<li>${inlineMd(ol[1])}</li>`; i++; continue }
     if (line.trim() === '') { closeList(); i++; continue }
     closeList()
+    const STOP = /^(```|#{1,4}\s|>\s?|[-*]\s|\d+\.\s)/
     const buf = [line]; i++
-    while (i < lines.length && lines[i].trim() !== '' && !/^```/.test(lines[i]) && !/^(#{1,4})\s/.test(lines[i]) && !/^>\s?/.test(lines[i]) && !/^[-*]\s/.test(lines[i]) && !/^\d+\.\s/.test(lines[i])) { buf.push(lines[i]); i++ }
-    html += `<p>${inlineMd(buf.join('<br>'))}</p>`
+    while (i < lines.length && lines[i].trim() !== '' && !STOP.test(lines[i])) { buf.push(lines[i]); i++ }
+    let para = buf.join('\n')
+    // 裸多行代码（模型未用围栏）自动渲染为代码块 + 复制按钮；其余按普通段落
+    if (looksLikeCode(para)) {
+      // 合并被空行隔开的相邻代码块（如 #include 单独成行），避免一段代码被拆成多个块
+      while (i < lines.length) {
+        let j = i
+        while (j < lines.length && lines[j].trim() === '') j++ // 跳过空行
+        if (j >= lines.length || STOP.test(lines[j])) break
+        const nbuf = []
+        let k = j
+        while (k < lines.length && lines[k].trim() !== '' && !STOP.test(lines[k])) { nbuf.push(lines[k]); k++ }
+        if (!looksLikeCode(nbuf.join('\n'))) break
+        para += '\n' + nbuf.join('\n')
+        i = k
+      }
+      let code = para.trim()
+      // 模型偶尔用跨行反引号整体包裹代码，剥掉首尾反引号
+      if (code.startsWith('`') && code.endsWith('`')) code = code.slice(1, -1)
+      html += renderCodeBlock(code, detectLang(code))
+    } else {
+      html += `<p>${inlineMd(para)}</p>`
+    }
   }
   closeList()
   return html
@@ -913,6 +1009,18 @@ function setupEventListeners() {
       renameTask(currentTaskId, item ? item.textContent.replace(/^● /, '') : '')
     }
   })
+
+  // 技能包（zip）一键安装：点击按钮触发文件选择，选中后上传
+  const btnInstallSkill = document.getElementById('btnInstallSkill')
+  const skillZipInput = document.getElementById('skillZipInput')
+  if (btnInstallSkill && skillZipInput) {
+    btnInstallSkill.addEventListener('click', () => skillZipInput.click())
+    skillZipInput.addEventListener('change', (e) => {
+      const f = e.target.files && e.target.files[0]
+      if (f) installSkillFromZipFile(f)
+      e.target.value = '' // 允许重复选同一文件
+    })
+  }
 
   // Esc 关闭弹窗
   document.addEventListener('keydown', (e) => {
