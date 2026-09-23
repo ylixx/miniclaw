@@ -20,8 +20,8 @@ const MAX_WRITE_BYTES = 5 * 1024 * 1024  // 单次写入上限 5MB
 // （实测 4B 模型在"排版文档"时经常偷懒这样写，而不是调用 create_docx）。
 // 这里直接拒绝，并在报错里告诉模型正确工具——错误信息会回到模型，形成自我纠正。
 const CONTAINER_HINTS = {
-  '.docx': '生成或排版 Word 请改用 create_docx 工具（blocks 数组描述 heading/paragraph/bullets/table）',
-  '.pptx': '生成或排版 PPT 请改用 create_pptx 工具',
+  '.docx': '生成 Word 请改用 create_docx。它可直接吃 Markdown：若已写好 .md，直接调用 create_docx({"path":"<目标.docx>","from_md":"<已有.md>"})；也可 create_docx({"path":"<目标.docx>","markdown":"# 标题\\n\\n正文..."})。不要用 blocks 数组（太复杂）',
+  '.pptx': '生成 PPT 请改用 create_pptx 工具',
   '.xlsx': '生成 Excel 请改用表格专用工具，或先落 .csv 再转换',
   '.zip': '打包 zip 请使用命令行工具',
 }

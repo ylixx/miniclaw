@@ -52,6 +52,43 @@ function encodeXml(s) {
     .replace(/'/g, '&apos;')
 }
 
+// ── 轻量 Markdown → blocks ───────────────────────────────────
+// 4B 模型填不对嵌套的 blocks 对象数组（实测：它会退化成反复用 write_file 写纯文本，
+// 产出打不开的伪 docx），但它很擅长写 Markdown。所以允许直接喂 Markdown 文本
+// 或已写好的 .md 文件路径，把结构化成本从模型侧挪到服务端。
+function markdownToBlocks(md) {
+  const lines = String(md || '').split(/\r?\n/)
+  const blocks = []
+  let list = null
+  let table = null
+  const flush = () => {
+    if (list) { blocks.push({ type: 'bullets', items: list }); list = null }
+    if (table) { blocks.push({ type: 'table', rows: table }); table = null }
+  }
+  for (const raw of lines) {
+    const line = raw.trim()
+    const h = /^(#{1,6})\s+(.*)$/.exec(line)
+    const isRow = /^\|.*\|$/.test(line)
+    const li = /^[-*+]\s+(.*)$/.exec(line)
+    const num = /^\d+[.)]\s+(.*)$/.exec(line)
+
+    if (h) { flush(); blocks.push({ type: 'heading', level: h[1].length, text: h[2].trim() }); continue }
+    if (isRow) {
+      const cells = line.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim())
+      if (cells.every(c => /^:?-{2,}:?$/.test(c))) continue   // |---|---| 分隔行
+      if (!table) { flush(); table = [] }
+      table.push(cells)
+      continue
+    }
+    if (li || num) { flush(); if (!list) list = []; list.push((li ? li[1] : num[1]).trim()); continue }
+    flush()
+    if (!line) continue
+    blocks.push({ type: 'paragraph', text: line })
+  }
+  flush()
+  return blocks
+}
+
 export function registerDocxOps(registry, { getBaseDir } = {}) {
   const getCtx = () => {
     const bd = getBaseDir()
@@ -61,30 +98,43 @@ export function registerDocxOps(registry, { getBaseDir } = {}) {
   // ── 生成 DOCX ────────────────────────────────────────────────
   registry.register({
     name: 'create_docx',
-    description: '根据结构化大纲生成 Word(.docx) 文档。支持标题、正文段落、无序列表、表格与封面标题。文件落在当前任务工作区。',
+    description: '生成 Word(.docx)。内容三选一：markdown(推荐，直接把 Markdown 文本粘进来)、from_md(已写好的 .md 文件路径)、blocks(结构化数组)。示例：create_docx({"path":"output/排版结果.docx","from_md":"output/排版结果.md"})',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: '输出 .docx 文件路径（工作区内，须以 .docx 结尾）' },
         title: { type: 'string', description: '文档标题（生成文档最前的大标题，可选）' },
         author: { type: 'string', description: '作者署名，写入文档属性，可选' },
+        markdown: { type: 'string', description: '推荐：Markdown 文本，自动转标题/列表/表格/段落' },
+        from_md: { type: 'string', description: '推荐：已存在的 .md 文件路径，自动转 docx（与 markdown 二选一）' },
         blocks: {
           type: 'array',
-          description: '内容块数组。每块: {type, ...}。type 可选 heading(需 text,level 1-6)/paragraph(需 text)/bullets(需 items 字符串数组)/table(需 rows 二维字符串数组，首行作表头)。',
+          description: '结构化内容块数组（markdown/from_md 更简单，优先用它们）。每块: {type, ...}。type 可选 heading(需 text,level 1-6)/paragraph(需 text)/bullets(需 items 字符串数组)/table(需 rows 二维字符串数组，首行作表头)。',
           items: { type: 'object' },
         },
       },
-      required: ['path', 'blocks'],
+      required: ['path'],
     },
-    async execute({ path: filePath, title, author, blocks }) {
+    async execute({ path: filePath, title, author, blocks, markdown, from_md }) {
       const { docx } = await ensureLibs()
       const {
         Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, Table, TableRow, TableCell, WidthType, BorderStyle,
       } = docx
-      if (!Array.isArray(blocks) || blocks.length === 0) throw new Error('blocks 必须是非空数组')
       const { guard, rel } = getCtx()
       const target = guard.resolve(filePath)
       if (!target.toLowerCase().endsWith('.docx')) throw new Error('文件路径必须以 .docx 结尾')
+
+      // 内容来源优先级：markdown > from_md > blocks
+      let contentBlocks = Array.isArray(blocks) ? blocks : []
+      if (from_md && String(from_md).trim()) {
+        const mdPath = await guard.resolveChecked(String(from_md), { allowDir: false })
+        contentBlocks = markdownToBlocks(await fs.readFile(mdPath, 'utf-8'))
+      } else if (markdown && String(markdown).trim()) {
+        contentBlocks = markdownToBlocks(markdown)
+      }
+      if (!Array.isArray(contentBlocks) || contentBlocks.length === 0) {
+        throw new Error('缺少内容：请提供 markdown、from_md 或 blocks（三者其一，推荐 markdown/from_md）')
+      }
 
       const headingLevels = [HeadingLevel.TITLE, HeadingLevel.HEADING_1, HeadingLevel.HEADING_2, HeadingLevel.HEADING_3, HeadingLevel.HEADING_4, HeadingLevel.HEADING_5, HeadingLevel.HEADING_6]
 
@@ -92,7 +142,7 @@ export function registerDocxOps(registry, { getBaseDir } = {}) {
       if (title) {
         children.push(new Paragraph({ text: title, heading: HeadingLevel.TITLE, alignment: AlignmentType.CENTER }))
       }
-      for (const b of blocks) {
+      for (const b of contentBlocks) {
         const t = b.type || 'paragraph'
         if (t === 'heading') {
           const lvl = Math.min(6, Math.max(1, Number(b.level) || 1))
@@ -134,7 +184,7 @@ export function registerDocxOps(registry, { getBaseDir } = {}) {
       })
       const buffer = await Packer.toBuffer(doc)
       await fs.writeFile(target, buffer)
-      return { success: true, path: rel(target), blockCount: blocks.length }
+      return { success: true, path: rel(target), blockCount: contentBlocks.length }
     },
   })
 

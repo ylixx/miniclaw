@@ -108,6 +108,7 @@ export class AgentEngine {
 
     const steps = []
     let stepCount = 0
+    this._failSignatures = new Map()   // 记录「工具+参数签名」失败次数，识别重复硬闯
 
     try {
       while (stepCount < this.hardMaxSteps) {
@@ -202,7 +203,17 @@ export class AgentEngine {
             if (result.needConfirm) {
               this._emit('safety', { tool: name, reason: result.error })
             }
-            this._selfVerifyHint = '上一步工具返回了错误或被安全拦截，请先核实参数、路径与权限，必要时修正后重试；若确实无法完成，明确告知用户原因。'
+            // 重复失败检测：4B 模型缺乏"换策略"能力，出错时倾向于原样重试
+            // （实测同一错误动作连试 8 次直到步数耗尽，最后还谎报成功）。
+            // 同一工具+同一参数签名失败 ≥2 次即强制禁止重试，并要求如实汇报。
+            const sig = `${name}|${JSON.stringify(args || {})}`
+            const fails = (this._failSignatures.get(sig) || 0) + 1
+            this._failSignatures.set(sig, fails)
+            if (fails >= 2) {
+              this._selfVerifyHint = `【禁止重试】你已用 ${name} 以完全相同的参数连续失败 ${fails} 次，继续重试没有任何意义。请立即改用别的工具或改变参数完成任务；若确实做不到，直接如实告诉用户失败原因和已完成的部分，严禁声称成功。`
+            } else {
+              this._selfVerifyHint = '上一步工具返回了错误或被安全拦截，请先核实参数、路径与权限，必要时修正后重试；若确实无法完成，明确告知用户原因。'
+            }
           }
 
           const resultText = buildToolResult(result)
@@ -566,6 +577,10 @@ export class AgentEngine {
   async _summarize(achieved) {
     const stepsText = this._recentSteps()
     const sys = '你是任务总结器。基于对话历史，用简体中文给用户一个简洁总结：已完成什么、未完成什么、下一步建议。不要输出 JSON。'
+      + '【判定规则·必须遵守】严格依据步骤记录里每个工具的返回结果判定成败：'
+      + '标记失败/error/被拒绝/被安全拦截的操作一律记为「未完成」，严禁把失败或重试中的操作说成成功；'
+      + '「成功创建 N 个」这类数字必须能在步骤记录里数出对应数量的成功返回，数不出来就不要写；'
+      + '若目标产物（如某个文件）没有任何一次成功的生成记录，必须明确写「未生成」。'
     const usr = `用户目标：\n${this.goal}\n\n已执行步骤：\n${stepsText}\n\n请给出总结（${achieved ? '目标已达成' : '达到步骤上限，未能在预算内完成'}）。`
     try {
       const r = await this._callModel([
