@@ -226,6 +226,15 @@ export class WorkspaceManager {
   }
 
   /**
+   * 读取任务完整对话历史（含 tool 调用），供 /api/tasks/:id/history 与激活接口使用。
+   */
+  getTaskHistory(taskId) {
+    const found = this.findTask(taskId)
+    if (!found) return []
+    return found.task.messages || []
+  }
+
+  /**
    * 返回当前激活任务所属项目的绝对工作目录。
    * 无激活任务时返回首个项目目录，兜底 baseDir。
    * 供文件/命令工具的 PathGuard 动态作为沙箱根（让"选本地文件夹当工作区"真正生效）。

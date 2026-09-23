@@ -220,8 +220,9 @@ async function loadTasks() {
 
 function createNewTask() {
   $('#taskTitle').value = ''
-  // 重置工作区选择（强制手动选，不预选）
-  document.querySelectorAll('input[name="taskWsMode"]').forEach(r => { r.checked = false })
+  // 默认预选「继承项目工作区」：普通任务不建文件夹，直接复用项目目录；
+  // 需要隔离时再手动切换为「新建文件夹 / 选本地文件夹」
+  document.querySelectorAll('input[name="taskWsMode"]').forEach(r => { r.checked = (r.value === 'inherit') })
   const td = $('#taskDir'); if (td) td.value = ''
   const pr = $('#taskWsPickRow'); if (pr) pr.classList.add('hidden')
   const hint = $('#taskWsHint'); if (hint) hint.textContent = ''
@@ -234,9 +235,8 @@ async function confirmCreateTask() {
   const title = $('#taskTitle').value.trim() || `任务 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`
   if (!currentProjectId) return alert('请先在项目中选择或创建一个项目')
 
-  // 工作区：强制手动选择一种方式
-  const mode = document.querySelector('input[name="taskWsMode"]:checked')?.value
-  if (!mode) return alert('请先选择任务工作区方式（新建文件夹 / 选择本地文件夹 / 继承项目工作区）')
+  // 工作区：默认继承项目（不建文件夹）；未勾选时也按继承处理，不再强制弹窗
+  const mode = document.querySelector('input[name="taskWsMode"]:checked')?.value || 'inherit'
   let dir = ''
   if (mode === 'new' || mode === 'pick') {
     dir = $('#taskDir').value.trim()
@@ -779,17 +779,26 @@ function resetForm() {
 
 async function sendMessage() {
   const message = chatInput.value.trim()
-  if (!message || isLoading) return
+  // 先快照图片/附件数据：下面 removeChatImage() 会把 _chatImageDataUrl 置空，
+  // 必须在清空之前取走，否则 requestBody.image 会变成 null（图片白传、识别不到）。
+  const chatImage = _chatImageDataUrl
+  const hasImage = chatImage !== null
+  const chatFiles = _chatFileAttach.slice()
+  const hasAttach = chatFiles.length > 0
+
+  if (!message && !hasImage && !hasAttach) return
+  if (isLoading) return
 
   // 无任务时自动新建
   if (!currentTaskId) {
     if (!currentProjectId) {
       return appendMessage('system', '请先在左栏选择或创建项目')
     }
+    const title = hasImage ? '图片分析任务' : (hasAttach ? '文件分析任务' : message.slice(0, 30))
     const res = await fetch(`${API}/api/projects/${currentProjectId}/tasks`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: message.slice(0, 30) }),
+      body: JSON.stringify({ title }),
     })
     const data = await res.json()
     if (data.error) return appendMessage('system', `创建任务失败: ${data.error}`)
@@ -799,8 +808,24 @@ async function sendMessage() {
     renderChatWelcome(data.task.title)
   }
 
-  appendMessage('user', message)
+  // 发送用户消息
+  const userMessageContent = hasImage ? 
+    `📷 ${message}\n\n[图片已上传]` : 
+    (hasAttach ? `${message}\n\n[已上传 ${chatFiles.length} 个文件]` : message)
+  
+  appendMessage('user', userMessageContent)
+  
+  // 如果有图片，显示图片预览
+  if (hasImage) {
+    appendImageToChat(chatImage)
+  }
+  
+  // 清空输入和附件（数据已快照，UI 同步清掉）
   chatInput.value = ''
+  removeChatImage()
+  _chatFileAttach = []
+  renderAttachChips()
+  
   setLoading(true)
   hidePlan()
   window._live = { gotTool: false, gotResponse: false }
@@ -810,10 +835,24 @@ async function sendMessage() {
   showThinking('● 思考中…')
 
   try {
+    // 文本类附件内容内联进消息（模型可直接读到文件内容）
+    let fullMessage = message
+    for (const f of chatFiles) {
+      fullMessage += `\n\n[附件文件 ${f.name}]\n${f.content}`
+    }
+
+    const requestBody = { message: fullMessage, taskId: currentTaskId }
+    
+    // 如果有图片，添加到请求中（用上面快照的 chatImage，避免被 removeChatImage 清空）
+    if (hasImage) {
+      requestBody.image = chatImage
+      requestBody.hasImage = true
+    }
+    
     const res = await fetch(`${API}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, taskId: currentTaskId }),
+      body: JSON.stringify(requestBody),
     })
     const data = await res.json()
 
@@ -851,6 +890,19 @@ function appendMessage(role, content) {
   } else {
     div.textContent = content
   }
+  chatMessages.appendChild(div)
+  chatMessages.scrollTop = chatMessages.scrollHeight
+}
+
+function appendImageToChat(dataUrl) {
+  const div = document.createElement('div')
+  div.className = 'message user-image'
+  div.innerHTML = `
+    <div class="user-image-container">
+      <img src="${escapeHtml(dataUrl)}" alt="用户上传的图片">
+      <div class="image-caption">📷 用户上传的图片</div>
+    </div>
+  `
   chatMessages.appendChild(div)
   chatMessages.scrollTop = chatMessages.scrollHeight
 }
@@ -1079,6 +1131,92 @@ function renderMarkdown(src) {
   return html
 }
 
+// ── 图像分析集成到对话 ─────────────────────────────────────
+
+let _chatImageDataUrl = null   // 当前对话中的图片数据（一次一张，走视觉分析）
+let _chatFileAttach = []       // 文本类附件 [{name, content}]，发送时内联进消息
+
+const TEXT_EXT_RE = /\.(txt|md|markdown|json|csv|log|xml|yml|yaml|js|ts|py|java|c|cpp|h|css|html|ini|conf|sql)$/i
+const MAX_FILE_CHARS = 100000  // 单个附件注入消息的字符上限
+
+function isImageFile(f) { return f.type && f.type.startsWith('image/') }
+function isTextFile(f) { return (f.type && f.type.startsWith('text/')) || TEXT_EXT_RE.test(f.name) }
+
+// 统一入口：处理「+ 号选择」或「拖入」的文件列表
+function handlePickedFiles(files) {
+  for (const f of files) {
+    if (isImageFile(f)) {
+      if (_chatImageDataUrl) { alert('一次只支持一张图片，已保留先选的那张'); continue }
+      const reader = new FileReader()
+      reader.onload = () => { _chatImageDataUrl = reader.result; renderAttachChips() }
+      reader.readAsDataURL(f)
+    } else if (isTextFile(f)) {
+      if (_chatFileAttach.length >= 5) { alert('附件最多 5 个'); continue }
+      const reader = new FileReader()
+      reader.onload = () => {
+        _chatFileAttach.push({ name: f.name, content: String(reader.result).slice(0, MAX_FILE_CHARS) })
+        renderAttachChips()
+      }
+      reader.readAsText(f)
+    } else {
+      alert(`暂不支持该文件类型：${f.name}（支持图片与文本类文件）`)
+    }
+  }
+}
+
+// 输入框上方的附件芯片（图片缩略图 / 文件名），✕ 可单独移除
+function renderAttachChips() {
+  const box = document.getElementById('attachChips')
+  if (!box) return
+  const parts = []
+  if (_chatImageDataUrl) {
+    parts.push(`<div class="chip chip-image"><img src="${_chatImageDataUrl}" alt="图片">` +
+      `<button class="chip-x" onclick="removeChatImage()">✕</button></div>`)
+  }
+  for (let i = 0; i < _chatFileAttach.length; i++) {
+    parts.push(`<div class="chip chip-file"><span class="chip-name">📄 ${escapeHtml(_chatFileAttach[i].name)}</span>` +
+      `<button class="chip-x" onclick="removeFileAttach(${i})">✕</button></div>`)
+  }
+  box.innerHTML = parts.join('')
+  box.classList.toggle('hidden', parts.length === 0)
+}
+
+function removeFileAttach(i) {
+  _chatFileAttach.splice(i, 1)
+  renderAttachChips()
+}
+
+function removeChatImage() {
+  _chatImageDataUrl = null
+  renderAttachChips()
+}
+
+function setupImageUpload() {
+  // 「+」按钮 → 打开文件选择（图片 + 文本类文件）
+  const plusBtn = document.getElementById('btnPlus')
+  const fileInput = document.getElementById('chatFileInput')
+  if (plusBtn && fileInput) {
+    plusBtn.addEventListener('click', () => fileInput.click())
+    fileInput.addEventListener('change', (e) => {
+      const files = Array.from(e.target.files || [])
+      if (files.length) handlePickedFiles(files)
+      fileInput.value = ''
+    })
+  }
+  // 拖拽保留：直接拖到整个输入区即可，不再占独立版面
+  const shell = document.querySelector('.chat-input-area')
+  if (shell) {
+    shell.addEventListener('dragover', (e) => { e.preventDefault(); shell.classList.add('drag-over') })
+    shell.addEventListener('dragleave', () => shell.classList.remove('drag-over'))
+    shell.addEventListener('drop', (e) => {
+      e.preventDefault()
+      shell.classList.remove('drag-over')
+      const files = Array.from(e.dataTransfer.files || [])
+      if (files.length) handlePickedFiles(files)
+    })
+  }
+}
+
 // ── 事件监听 ──────────────────────────────────────────────
 
 function setupEventListeners() {
@@ -1086,6 +1224,8 @@ function setupEventListeners() {
   chatInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
   })
+  
+  setupImageUpload()
 
   btnReset.addEventListener('click', async () => {
     if (!currentTaskId) return
@@ -1149,8 +1289,7 @@ function setupEventListeners() {
     })
   })
 
-  // Agnes 图像：本地图片上传绑定
-  _bindAgnesFileInputs()
+  // 图片上传功能已在 setupImageUpload 中处理
 }
 
 // ── WebSocket ─────────────────────────────────────────────
@@ -1327,174 +1466,13 @@ function setupWebSocket() {
   ws.onclose = () => setTimeout(setupWebSocket, 3000)
 }
 
-// ── Agnes 图像（分析 / 生成）────────────────────────────
+// ── 图片上传提示 ──────────────────────────────────────────
 
-let _anDataUrl = null   // 分析：本地上传图片的 dataURL
-let _gnDataUrl = null   // 生成：本地参考图 dataURL
-
-function openAgnesModal() {
-  $('#agnesModal').classList.remove('hidden')
-  switchAgnesTab('analyze')
+function showImageUploadHint() {
+  $('#imageUploadHint').classList.remove('hidden')
 }
 
-function switchAgnesTab(tab) {
-  document.querySelectorAll('.agnes-tab').forEach(t => {
-    const isAnalyze = tab === 'analyze'
-    const hit = isAnalyze ? t.textContent.includes('分析') : t.textContent.includes('生成')
-    t.classList.toggle('active', hit)
-  })
-  $('#agnesAnalyze').classList.toggle('hidden', tab !== 'analyze')
-  $('#agnesGenerate').classList.toggle('hidden', tab !== 'generate')
-}
-
-function _bindAgnesFileInputs() {
-  const anFile = document.getElementById('anImageFile')
-  if (anFile) anFile.addEventListener('change', (e) => {
-    const f = e.target.files && e.target.files[0]
-    if (!f) return
-    const reader = new FileReader()
-    reader.onload = () => {
-      _anDataUrl = reader.result
-      const nameEl = document.getElementById('anImageName')
-      if (nameEl) nameEl.textContent = f.name
-      renderAnPreview(_anDataUrl)
-    }
-    reader.readAsDataURL(f)
-  })
-  const gnFile = document.getElementById('gnImageFile')
-  if (gnFile) gnFile.addEventListener('change', (e) => {
-    const f = e.target.files && e.target.files[0]
-    if (!f) return
-    const reader = new FileReader()
-    reader.onload = () => {
-      _gnDataUrl = reader.result
-      const nameEl = document.getElementById('gnImageName')
-      if (nameEl) nameEl.textContent = f.name
-    }
-    reader.readAsDataURL(f)
-  })
-}
-
-function renderAnPreview(src) {
-  const box = document.getElementById('anPreview')
-  if (!box) return
-  box.classList.remove('hidden')
-  box.innerHTML = `<img src="${src}" alt="预览"><div class="preview-cap">本地预览（上传后将转 base64 内联发送给 Agnes）</div>`
-}
-
-function showAnHint(type, msg) {
-  const el = document.getElementById('anAnalyzeHint')
-  if (!el) return
-  el.className = `test-result ${type}`
-  el.textContent = msg
-  el.classList.remove('hidden')
-}
-
-function showGnHint(type, msg) {
-  const el = document.getElementById('gnGenerateHint')
-  if (!el) return
-  el.className = `test-result ${type}`
-  el.textContent = msg
-  el.classList.remove('hidden')
-}
-
-async function runAnalyze() {
-  const url = document.getElementById('anImageUrl').value.trim()
-  const prompt = document.getElementById('anPrompt').value.trim() || '请详细描述这张图片的内容。'
-  const image = _anDataUrl || url   // 优先本地上传，其次 URL
-  if (!image) {
-    showAnHint('error', '请先填写图片 URL 或上传本地图片')
-    return
-  }
-  const btn = document.getElementById('anAnalyzeBtn')
-  if (btn) btn.disabled = true
-  showAnHint('', '分析中…')
-  try {
-    const res = await fetch(`${API}/api/vision/analyze`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image, prompt }),
-    })
-    const data = await res.json()
-    if (data.success) {
-      appendImageAnalysis(prompt, _anDataUrl || url, data.text)
-      showAnHint('success', `分析完成（model: ${data.model || 'agnes-2.5-flash'}）`)
-      setTimeout(() => closeModal('agnesModal'), 600)
-    } else {
-      showAnHint('error', `失败: ${data.error}`)
-    }
-  } catch (err) {
-    showAnHint('error', `请求失败: ${err.message}`)
-  } finally {
-    if (btn) btn.disabled = false
-  }
-}
-
-function appendImageAnalysis(prompt, imageSrc, text) {
-  const div = document.createElement('div')
-  div.className = 'message img-analysis'
-  div.innerHTML = `
-    <div class="ia-head">
-      <img class="ia-thumb" src="${escapeHtml(imageSrc)}" alt="分析图">
-      <div class="ia-q"><b>图像分析</b><br>${escapeHtml(prompt)}</div>
-    </div>
-    <div class="ia-text md-content">${renderMarkdown(text)}</div>`
-  chatMessages.appendChild(div)
-  chatMessages.scrollTop = chatMessages.scrollHeight
-}
-
-async function runGenerate() {
-  const prompt = document.getElementById('gnPrompt').value.trim()
-  if (!prompt) { showGnHint('error', '请填写生成指令'); return }
-  const url = document.getElementById('gnImageUrl').value.trim()
-  const image = _gnDataUrl || (url || undefined)   // 优先本地参考图，其次 URL
-  const size = document.getElementById('gnSize').value.trim() || '1024x768'
-  const ratio = document.getElementById('gnRatio').value.trim()
-  const format = document.getElementById('gnFormat').value  // 'url' | 'base64'
-  const btn = document.getElementById('gnGenerateBtn')
-  if (btn) btn.disabled = true
-  showGnHint('', '生成中…（免费档约 20 RPM，请稍候）')
-  try {
-    const res = await fetch(`${API}/api/image/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        prompt,
-        image,
-        size,
-        ratio: ratio || undefined,
-        returnBase64: format === 'base64',
-      }),
-    })
-    const data = await res.json()
-    if (data.success) {
-      renderGenResult(data, prompt)
-      showGnHint('success', '生成完成')
-    } else {
-      showGnHint('error', `失败: ${data.error}`)
-    }
-  } catch (err) {
-    showGnHint('error', `请求失败: ${err.message}`)
-  } finally {
-    if (btn) btn.disabled = false
-  }
-}
-
-function renderGenResult(data, prompt) {
-  const box = document.getElementById('gnResult')
-  if (!box) return
-  box.classList.remove('hidden')
-  let inner = ''
-  if (data.url) {
-    inner = `<img src="${escapeHtml(data.url)}" alt="生成结果"><div class="gen-cap">${escapeHtml(prompt)}<br><a href="${escapeHtml(data.url)}" target="_blank" rel="noopener">打开原图</a></div>`
-  } else if (data.b64_json) {
-    inner = `<img src="data:image/png;base64,${data.b64_json}" alt="生成结果"><div class="gen-cap">${escapeHtml(prompt)}</div>`
-  } else {
-    inner = `<div class="gen-cap">未返回图片数据</div>`
-  }
-  if (data.revised_prompt) inner += `<div class="gen-cap">修订提示词：${escapeHtml(data.revised_prompt)}</div>`
-  box.innerHTML = inner
-}
+// ── 全局导出 ──────────────────────────────────────────────
 
 // ── 全局导出 ──────────────────────────────────────────────
 
@@ -1533,9 +1511,6 @@ window.resetForm = resetForm
 window.editModel = editModel
 window.deleteModel = deleteModel
 window.activateModel = activateModel
-window.openAgnesModal = openAgnesModal
-window.switchAgnesTab = switchAgnesTab
-window.runAnalyze = runAnalyze
-window.runGenerate = runGenerate
+window.showImageUploadHint = showImageUploadHint
 
 init()

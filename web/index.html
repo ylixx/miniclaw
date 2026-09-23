@@ -42,7 +42,7 @@
         <button class="nav-btn" onclick="openSkillsModal()" title="技能">⚡ 技能</button>
         <button class="nav-btn" onclick="openModelsModal()" title="模型">🧠 模型</button>
         <button class="nav-btn" onclick="openMcpModal()" title="MCP">🔌 MCP</button>
-        <button class="nav-btn" onclick="openAgnesModal()" title="Agnes 图像">🎨 图像</button>
+        <button class="nav-btn" onclick="showImageUploadHint()" title="图像分析">📷</button>
       </nav>
       <div class="status-bar">
         <span id="statusIndicator" class="status-dot idle"></span>
@@ -77,9 +77,16 @@
       </div>
       <div class="chat-input-area">
         <div id="thinkingPill" class="thinking-pill hidden">● 执行中…</div>
-        <div class="input-row">
-          <textarea id="chatInput" placeholder="输入消息... (Enter 发送)" rows="2"></textarea>
-          <button id="btnSend" class="btn-send">发送</button>
+        <div class="input-shell">
+          <div id="attachChips" class="attach-chips hidden"></div>
+          <textarea id="chatInput" placeholder="输入消息... (Enter 发送，支持图片/文件)" rows="2"></textarea>
+          <div class="input-toolbar">
+            <button id="btnPlus" class="btn-plus" title="上传图片或文件">＋</button>
+            <input type="file" id="chatFileInput" multiple style="display:none"
+                   accept="image/*,.txt,.md,.markdown,.json,.csv,.log,.xml,.yml,.yaml,.js,.ts,.py,.java,.c,.cpp,.h,.css,.html,.ini,.conf,.sql">
+            <div class="toolbar-spacer"></div>
+            <button id="btnSend" class="btn-send">发送</button>
+          </div>
         </div>
       </div>
     </main>
@@ -338,93 +345,21 @@
     </div>
   </div>
 
-  <!-- ═══ Agnes 图像弹窗（分析 / 生成）═══ -->
-  <div id="agnesModal" class="modal hidden">
-    <div class="modal-content modal-wide">
+  <!-- 图片上传提示 -->
+  <div id="imageUploadHint" class="modal hidden">
+    <div class="modal-content">
       <div class="modal-header">
-        <h3>🎨 Agnes 图像</h3>
-        <button class="modal-close" onclick="closeModal('agnesModal')">✕</button>
+        <h3>📷 图像分析</h3>
+        <button class="modal-close" onclick="closeModal('imageUploadHint')">✕</button>
       </div>
-
-      <div class="agnes-tabs">
-        <button class="agnes-tab active" onclick="switchAgnesTab('analyze')">🔍 图像分析</button>
-        <button class="agnes-tab" onclick="switchAgnesTab('generate')">🖌️ 图像生成</button>
-      </div>
-
-      <!-- 图像分析 -->
-      <div id="agnesAnalyze" class="agnes-panel">
-        <div class="models-section">
-          <h4>图片来源（URL 或本地上传，二选一）</h4>
-          <div class="form-row">
-            <label>图片 URL（公开可访问）</label>
-            <input id="anImageUrl" type="text" placeholder="https://example.com/image.png">
-          </div>
-          <div class="upload-row">
-            <label class="btn-secondary upload-label">
-              上传本地图片
-              <input type="file" id="anImageFile" accept="image/*" style="display:none">
-            </label>
-            <span id="anImageName" class="upload-name"></span>
-          </div>
-          <div id="anPreview" class="img-preview hidden"></div>
-        </div>
-        <div class="models-section">
-          <h4>分析指令</h4>
-          <div class="model-form">
-            <div class="form-row">
-              <textarea id="anPrompt" rows="3" placeholder="请描述这张图片的内容，或提出具体问题">请详细描述这张图片的内容。</textarea>
-            </div>
-            <div class="form-actions">
-              <button class="btn-primary" id="anAnalyzeBtn" onclick="runAnalyze()">分析图片</button>
-              <span id="anAnalyzeHint" class="test-result hidden"></span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- 图像生成 -->
-      <div id="agnesGenerate" class="agnes-panel hidden">
-        <div class="models-section">
-          <h4>生成指令（文生图 / 图生图）</h4>
-          <div class="model-form">
-            <div class="form-row">
-              <textarea id="gnPrompt" rows="3" placeholder="例如：一个赛博朋克风格的未来城市夜景，霓虹灯光，电影级构图"></textarea>
-            </div>
-            <div class="form-row">
-              <label>参考图（可选，图生图时作为编辑底图）</label>
-              <input id="gnImageUrl" type="text" placeholder="参考图 URL（可留空做纯文生图）">
-            </div>
-            <div class="form-row" id="gnFileRow">
-              <label class="btn-secondary upload-label">
-                上传参考图（本地，图生图时作为底图）
-                <input type="file" id="gnImageFile" accept="image/*" style="display:none">
-              </label>
-              <span id="gnImageName" class="upload-name"></span>
-            </div>
-            <div class="form-row-group">
-              <div class="form-row">
-                <label>尺寸 size</label>
-                <input id="gnSize" type="text" value="1024x768" placeholder="1024x768 / 2K / 1K ...">
-              </div>
-              <div class="form-row">
-                <label>比例 ratio（可选）</label>
-                <input id="gnRatio" type="text" placeholder="如 16:9" value="">
-              </div>
-              <div class="form-row">
-                <label>输出格式</label>
-                <select id="gnFormat">
-                  <option value="url">图片 URL</option>
-                  <option value="base64">Base64</option>
-                </select>
-              </div>
-            </div>
-            <div class="form-actions">
-              <button class="btn-primary" id="gnGenerateBtn" onclick="runGenerate()">生成图片</button>
-              <span id="gnGenerateHint" class="test-result hidden"></span>
-            </div>
-          </div>
-        </div>
-        <div id="gnResult" class="gen-result hidden"></div>
+      <div class="modal-body">
+        <p>💡 在聊天中，你可以：</p>
+        <ul style="margin: 12px 0; padding-left: 20px;">
+          <li>📷 点击输入框旁边的 📷 按钮上传图片</li>
+          <li>🖼️ 直接在对话中描述图片内容或提问</li>
+          <li>🔍 支持拖拽上传图片到聊天区域</li>
+        </ul>
+        <p>上传图片后，模型会自动分析图片内容并回答你的问题。</p>
       </div>
     </div>
   </div>

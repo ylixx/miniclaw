@@ -23,6 +23,7 @@ import { registerDocxOps } from './tools/docx-ops.js'
 import { registerXlsxOps } from './tools/xlsx-ops.js'
 import { registerPdfOps } from './tools/pdf-ops.js'
 import { registerShell } from './tools/shell.js'
+import { registerScriptOps } from './tools/script-ops.js'
 import { MCPClient } from './mcp/client.js'
 import { SkillsManager } from './skills/loader.js'
 import { installSkillFromZip } from './skills/install.js'
@@ -46,58 +47,41 @@ function getBaseDir() {
   }
 }
 
+function getPermissionMode() {
+  try {
+    return (workspace && typeof workspace.getPermissionMode === 'function' && workspace.getPermissionMode()) || 'guarded'
+  } catch {
+    return 'guarded'
+  }
+}
+
 const tools = new ToolRegistry()
-registerFileOps(tools, { getBaseDir, getPermissionMode: () => getModelConfig().permissionMode })
+
+// 注册内置工具（文件/文档/Office 等）。
+// 关键：这些 register* 调用必须执行，否则 ToolRegistry 为空——
+// 全部工具（含 docx/xlsx/pptx/pdf 等 Office 文档操作）都不会注入给模型，界面里"用不了"。
+registerFileOps(tools, { getBaseDir, getPermissionMode })
 registerDocOps(tools, { getBaseDir })
 registerPptxOps(tools, { getBaseDir })
 registerDocxOps(tools, { getBaseDir })
 registerXlsxOps(tools, { getBaseDir })
 registerPdfOps(tools, { getBaseDir })
-registerShell(tools, { getBaseDir, getPermissionMode: () => getModelConfig().permissionMode })
-
-const mcp = new MCPClient(CONFIG_DIR, BASE_DIR)
+const mcp = new MCPClient(CONFIG_DIR)
 const skills = new SkillsManager(CONFIG_DIR)
 const modelManager = new ModelManager(CONFIG_DIR)
-const workspace = new WorkspaceManager(CONFIG_DIR, BASE_DIR)
-
-await modelManager.init()
-await mcp.init()
-await skills.init()
-await workspace.init()
-
-// 模型配置
-function getModelConfig() {
-  const active = modelManager.getActive()
-  if (!active) {
-    return {
-      baseURL: 'http://localhost:11434/v1',
-      model: 'qwen3:4b',
-      apiKey: '***',
-      maxTokens: 2048,
-      contextLength: 32768,
-      maxSteps: 8,
-      temperature: 0.3,
-      baseDir: getBaseDir(),
-      permissionMode: process.env.PERMISSION_MODE || 'guarded',
-    }
-  }
-  return {
-    baseURL: active.baseURL,
-    model: active.model,
-    apiKey: active.apiKey || '***',
-    maxTokens: active.maxTokens || 2048,
-    contextLength: active.contextLength || 32768,
-    maxSteps: 8,
-    temperature: active.temperature || 0.3,
-    baseDir: getBaseDir(),
-    permissionMode: process.env.PERMISSION_MODE || active.permissionMode || 'guarded',
-  }
-}
-
-let engine = new AgentEngine({ tools, mcpClient: mcp, skills, config: getModelConfig(), workspace })
+const workspace = new WorkspaceManager(BASE_DIR, CONFIG_DIR)
+const clients = new Set() // 活跃 WebSocket 连接，用于事件广播
+let engine = null
 
 function rebuildEngine() {
   engine = new AgentEngine({ tools, mcpClient: mcp, skills, config: getModelConfig(), workspace })
+  // 每次重建引擎（引擎对象会被替换）后重新挂载事件广播
+  engine.onEvent = (event, data) => {
+    const msg = JSON.stringify({ event, data })
+    for (const c of clients) {
+      try { c.send(msg) } catch {}
+    }
+  }
 }
 
 // MCP 工具同步到注册表
@@ -139,8 +123,9 @@ app.post('/api/skills/install', express.raw({ type: 'application/zip', limit: '1
 // ── 对话 API ───────────────────────────────────────────────────
 
 app.post('/api/chat', async (req, res) => {
-  const { message, taskId } = req.body
-  if (!message) return res.status(400).json({ error: 'message required' })
+  const { message, taskId, image, hasImage } = req.body
+  // 允许「只发图不写文字」：图片分析场景下 message 可为空，仅当两者皆空才拦截
+  if (!message && !hasImage) return res.status(400).json({ error: 'message required' })
   try {
     // 若指定 taskId 且与当前不同，先切换
     if (taskId && taskId !== engine.getState().taskId) {
@@ -153,7 +138,45 @@ app.post('/api/chat', async (req, res) => {
         await engine.bindTask(active.id)
       }
     }
-    const result = await engine.handleMessage(message)
+    
+    // 如果有图片，先进行图像分析
+    let imageAnalysis = null
+    if (image && hasImage) {
+      try {
+        // 视觉分析统一走 Agnes 多模态服务：baseURL/apiKey 取当前激活模型，
+        // 模型名默认 agnes-2.5-flash（视觉端点）。注意 analyzeImage 需要一个
+        // 配置对象，而不是 (image, message) 两个位置参数——之前这里签名写错，
+        // 导致 baseURL/apiKey 全丢、图片根本没送进模型。
+        const cfg = resolveAgnesConfig({}, { model: 'agnes-2.5-flash' })
+        imageAnalysis = await analyzeImage({
+          baseURL: cfg.baseURL,
+          apiKey: cfg.apiKey,
+          model: cfg.model || 'agnes-2.5-flash',
+          image,
+          prompt: message || '请描述这张图片的内容。',
+          maxTokens: 1024,
+          temperature: 0.4,
+        })
+        console.log('图像分析完成:', imageAnalysis?.text)
+      } catch (err) {
+        console.error('图像分析失败:', err)
+        // 把失败原因透传给前端，避免"传了图却得到无关纯文本回答"的困惑
+        imageAnalysis = { text: '', error: err.message }
+      }
+    }
+    
+    // 构建增强的消息：仅当视觉分析成功且有文本时才注入结果。
+    // 若分析失败（imageAnalysis.error 存在），不注入——避免模型拿空结果瞎答。
+    let enhancedMessage = message
+    if (imageAnalysis && imageAnalysis.text) {
+      enhancedMessage = `${message}\n\n[图像分析结果] ${imageAnalysis.text}`
+    }
+
+    const result = await engine.handleMessage(enhancedMessage)
+    // 把视觉分析的失败原因回传给前端，便于明确提示，不再静默吞掉
+    if (imageAnalysis && imageAnalysis.error) {
+      result.imageAnalysisError = imageAnalysis.error
+    }
     res.json(result)
   } catch (err) {
     // 错误分类：区分网络/端点不可达、超时、模型 API 错误，给出可读提示
@@ -236,30 +259,33 @@ app.delete('/api/projects/:id', async (req, res) => {
   }
 })
 
-// ── 任务管理 API ───────────────────────────────────────────────
+// ── 任务管理 API ──────────────────────────────────────────────
 
-// 列出项目下的任务
-app.get('/api/projects/:id/tasks', (req, res) => {
-  res.json(workspace.listTasks(req.params.id))
+app.get('/api/projects/:id/tasks', async (req, res) => {
+  try {
+    const tasks = await workspace.listTasks(req.params.id)
+    res.json(tasks)
+  } catch (err) {
+    res.status(400).json({ error: err.message })
+  }
 })
 
-// 创建任务（自动激活）
 app.post('/api/projects/:id/tasks', async (req, res) => {
   try {
     const task = await workspace.createTask(req.params.id, req.body)
-    await engine.bindTask(task.id)
     res.json({ success: true, task })
   } catch (err) {
     res.status(400).json({ error: err.message })
   }
 })
 
-// 切换任务（恢复历史）
+// 激活/切换任务：设置激活态 + 绑定引擎历史 + 返回该任务对话历史
 app.post('/api/tasks/:id/activate', async (req, res) => {
   try {
     await workspace.setActiveTask(req.params.id)
     await engine.bindTask(req.params.id)
     const found = workspace.findTask(req.params.id)
+    if (!found) return res.status(404).json({ error: '任务不存在' })
     res.json({
       success: true,
       task: { ...found.task, messages: undefined },
@@ -282,7 +308,6 @@ app.get('/api/tasks/:id', (req, res) => {
   })
 })
 
-// 重命名任务
 app.put('/api/tasks/:id', async (req, res) => {
   try {
     const task = await workspace.updateTask(req.params.id, req.body)
@@ -292,13 +317,19 @@ app.put('/api/tasks/:id', async (req, res) => {
   }
 })
 
-// 删除任务
 app.delete('/api/tasks/:id', async (req, res) => {
   try {
-    const wasActive = workspace.activeTaskId === req.params.id
     await workspace.deleteTask(req.params.id)
-    if (wasActive) engine.bindTask(null)
     res.json({ success: true })
+  } catch (err) {
+    res.status(400).json({ error: err.message })
+  }
+})
+
+app.get('/api/tasks/:id/history', async (req, res) => {
+  try {
+    const history = await workspace.getTaskHistory(req.params.id)
+    res.json(history)
   } catch (err) {
     res.status(400).json({ error: err.message })
   }
@@ -306,17 +337,27 @@ app.delete('/api/tasks/:id', async (req, res) => {
 
 // ── 模型管理 API ───────────────────────────────────────────────
 
+function getModelConfig() {
+  const active = modelManager.getActive()
+  if (!active) return {}
+  return {
+    baseURL: active.baseURL,
+    apiKey: active.apiKey,
+    model: active.model,
+    maxTokens: active.maxTokens || 2048,
+    contextLength: active.contextLength || 32768,
+    temperature: active.temperature || 0.3,
+  }
+}
+
 app.get('/api/models', (req, res) => {
   res.json(modelManager.list())
-})
-
-app.get('/api/models/templates', (req, res) => {
-  res.json(modelManager.getProviderTemplates())
 })
 
 app.post('/api/models', async (req, res) => {
   try {
     const model = await modelManager.add(req.body)
+    rebuildEngine()
     res.json({ success: true, model })
   } catch (err) {
     res.status(400).json({ error: err.message })
@@ -326,6 +367,7 @@ app.post('/api/models', async (req, res) => {
 app.put('/api/models/:id', async (req, res) => {
   try {
     const model = await modelManager.update(req.params.id, req.body)
+    rebuildEngine()
     res.json({ success: true, model })
   } catch (err) {
     res.status(400).json({ error: err.message })
@@ -335,6 +377,7 @@ app.put('/api/models/:id', async (req, res) => {
 app.delete('/api/models/:id', async (req, res) => {
   try {
     await modelManager.remove(req.params.id)
+    rebuildEngine()
     res.json({ success: true })
   } catch (err) {
     res.status(400).json({ error: err.message })
@@ -377,6 +420,7 @@ app.post('/api/models/fetch', async (req, res) => {
  */
 function resolveAgnesConfig(body = {}, fallback = {}) {
   const active = modelManager.getActive() || {}
+
   const cfg = {
     baseURL: body.baseURL || active.baseURL || '',
     apiKey: body.apiKey || active.apiKey || '***',
@@ -407,74 +451,77 @@ app.post('/api/vision/analyze', async (req, res) => {
     res.json({ success: true, ...result })
   } catch (err) {
     const msg = (err.message || '').toLowerCase()
-    const isNet = /fetch failed|econnrefused|enotfound|etimedout|err_ssl|ssl|certificate|getaddrinfo|network/i.test(msg)
-    if (isNet) {
-      res.status(502).json({ error: `Agnes 端点不可达：${err.message}（检查 baseURL、网络、API Key）` })
+    if (msg.includes('unauthorized') || msg.includes('invalid api key')) {
+      res.status(401).json({ error: `Agnes API 认证失败：${err.message}（请检查 API Key 是否正确）` })
+    } else if (msg.includes('rate limit') || msg.includes('too many requests')) {
+      res.status(429).json({ error: `Agnes API 限流：${err.message}（请稍后重试）` })
     } else {
       res.status(500).json({ error: err.message })
     }
   }
 })
 
-// 图像生成/编辑：agnes-image-2.5-flash，文生图或图生图
+// 图像生成（文生图/图生图）：agnes-image-2.5-flash，返回图片 URL 或 base64
 app.post('/api/image/generate', async (req, res) => {
-  const { prompt, image, size, ratio, returnBase64 } = req.body || {}
-  if (!prompt || !prompt.trim()) return res.status(400).json({ error: 'prompt 必填' })
+  const { prompt, image, size, ratio, returnBase64, model } = req.body || {}
+  if (!prompt) return res.status(400).json({ error: 'prompt 必填' })
   try {
     const cfg = resolveAgnesConfig(req.body, { model: 'agnes-image-2.5-flash' })
     const result = await generateImage({
       baseURL: cfg.baseURL,
       apiKey: cfg.apiKey,
-      model: model_safe(req.body?.model) || 'agnes-image-2.5-flash',
+      model: model || cfg.model || 'agnes-image-2.5-flash',
       prompt,
       image,
-      size: size || '1024x768',
+      size,
       ratio,
-      returnBase64: !!returnBase64,
+      returnBase64,
     })
     res.json({ success: true, ...result })
   } catch (err) {
     const msg = (err.message || '').toLowerCase()
-    const isNet = /fetch failed|econnrefused|enotfound|etimedout|err_ssl|ssl|certificate|getaddrinfo|network/i.test(msg)
-    if (isNet) {
-      res.status(502).json({ error: `Agnes 端点不可达：${err.message}（检查 baseURL、网络、API Key）` })
+    if (msg.includes('unauthorized') || msg.includes('invalid api key')) {
+      res.status(401).json({ error: `Agnes API 认证失败：${err.message}（请检查 API Key 是否正确）` })
+    } else if (msg.includes('rate limit') || msg.includes('too many requests')) {
+      res.status(429).json({ error: `Agnes API 限流：${err.message}（请稍后重试）` })
     } else {
       res.status(500).json({ error: err.message })
     }
   }
 })
 
-// 安全取 model：仅当显式传入非空字符串时使用，否则用默认图像模型名（避免误用文本模型名调图像端点）
-function model_safe(m) {
-  return typeof m === 'string' && m.trim() ? m.trim() : null
-}
+// ── Skills API ──────────────────────────────────────────────────
 
-// ── 工具 / Skills API ─────────────────────────────────────────
+app.get('/api/skills', (req, res) => {
+  res.json(skills.list())
+})
 
-app.get('/api/tools', (req, res) => res.json(tools.list()))
-
-app.get('/api/skills', (req, res) => res.json(skills.list()))
-
-// 激活技能（带参数）
-app.post('/api/skills/:name/activate', async (req, res) => {
+app.post('/api/skills/activate', async (req, res) => {
+  const { name, params } = req.body
   try {
-    const info = skills.activate(req.params.name, req.body || {})
-    res.json({ success: true, ...info })
+    await skills.activate(name, params)
+    rebuildEngine()
+    res.json({ success: true })
   } catch (err) {
     res.status(400).json({ error: err.message })
   }
 })
 
-// 停用技能
-app.post('/api/skills/:name/deactivate', (req, res) => {
-  skills.deactivate(req.params.name)
-  res.json({ success: true })
+app.post('/api/skills/deactivate', async (req, res) => {
+  const { name } = req.body
+  try {
+    await skills.deactivate(name)
+    rebuildEngine()
+    res.json({ success: true })
+  } catch (err) {
+    res.status(400).json({ error: err.message })
+  }
 })
 
-// 创建自定义技能
-app.post('/api/skills', async (req, res) => {
+app.post('/api/skills/custom', async (req, res) => {
   try {
-    const skill = await skills.createCustom(req.body)
+    const skill = await skills.addCustom(req.body)
+    rebuildEngine()
     res.json({ success: true, skill })
   } catch (err) {
     res.status(400).json({ error: err.message })
@@ -527,13 +574,6 @@ app.post('/api/mcp/:name/connect', async (req, res) => {
   }
 })
 
-// 连接全部
-app.post('/api/mcp/connect-all', async (req, res) => {
-  const results = await mcp.connectAll()
-  await syncMCPTools()
-  res.json({ success: true, results })
-})
-
 // 断开
 app.post('/api/mcp/:name/disconnect', async (req, res) => {
   await mcp.disconnect(req.params.name)
@@ -554,16 +594,29 @@ app.delete('/api/mcp/:name', async (req, res) => {
 const server = createServer(app)
 const wss = new WebSocketServer({ server })
 
+// 连接只负责登记/注销；事件广播在 rebuildEngine 中统一处理（支持多标签页并发）
 wss.on('connection', (ws) => {
-  engine.onEvent = (event, data) => {
-    try { ws.send(JSON.stringify({ event, data })) } catch {}
-  }
-  ws.on('close', () => { engine.onEvent = null })
+  clients.add(ws)
+  ws.on('close', () => clients.delete(ws))
 })
 
 // ── 启动 ───────────────────────────────────────────────────────
 
+// 必须先加载磁盘上的模型配置（models.json）。否则 modelManager 内存里模型列表为空，
+// getActive() 返回 undefined，会导致：
+//   1) 视觉分析 resolveAgnesConfig 抛「未配置 Agnes 模型」——图片分析失败（驴唇不对马嘴的根因）；
+//   2) engine 回退到默认 Ollama qwen3:4b，与激活的 Agnes 模型对不上。
+await modelManager.init()
+// 同样必须先把磁盘配置读进内存，否则重启后项目/任务、技能、MCP 服务器「看不见」：
+//   - workspace.init()：读取 workspace.json（项目/任务历史）
+//   - skills.init()：扫描 skills 目录（自定义技能）
+//   - mcp.init()：读取已保存的 MCP 服务器配置（仅加载，不主动连接）
+await workspace.init()
+await skills.init()
+await mcp.init()
 const active = modelManager.getActive()
+// 启动即构建引擎，避免 WebSocket 连接时 engine 仍为 null 导致崩溃
+rebuildEngine()
 server.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
@@ -577,4 +630,18 @@ server.listen(PORT, () => {
 ║  MCP:      ${String(mcp.listServers().length + ' servers').padEnd(37)}║
 ╚══════════════════════════════════════════════════╝
   `)
+  
+  // 保持服务器运行
+  console.log('🚀 服务器已启动，按 Ctrl+C 停止')
+  
+  // 优雅关闭
+  process.on('SIGINT', () => {
+    console.log('\n👋 正在关闭服务器...')
+    wss.close(() => {
+      server.close(() => {
+        console.log('✅ 服务器已关闭')
+        process.exit(0)
+      })
+    })
+  })
 })

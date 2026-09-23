@@ -8,7 +8,8 @@ node_modules/
 .backup/
 
 # Agent workspace: generated artifacts / tools / temp files (not source code)
-workspace/
+# 注意：必须是根级 /workspace/，否则会误伤源码目录 server/workspace/
+/workspace/
 
 # Logs
 *.log
