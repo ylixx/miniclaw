@@ -47,9 +47,31 @@ export class WorkspaceManager {
     } else {
       // 归一化历史数据：dir 统一解析为绝对路径（兼容旧数据存 '.' 或相对值）
       const defaultWs = path.join(this.baseDir, 'workspace')
+      const cfgDir = path.resolve(this.configDir)
+      const homeDir = process.env.HOME || process.env.USERPROFILE || ''
+      const legacyCfg = path.resolve(homeDir, '.miniagent')
+      // 配置目录或遗留配置目录(.miniagent)下的项目目录都需要迁回项目根，
+      // 因为 .miniagent 是安全网关受保护片段，且不应作为产物工作区。
+      const isUnder = (abs) => {
+        const a = abs.toLowerCase()
+        return a === cfgDir.toLowerCase() || a === legacyCfg.toLowerCase() ||
+          a.startsWith(cfgDir.toLowerCase() + path.sep) ||
+          a.startsWith(legacyCfg.toLowerCase() + path.sep)
+      }
       let changed = false
       for (const p of this.projects) {
-        const abs = path.resolve(this.baseDir, p.dir || '.')
+        let abs = path.resolve(this.baseDir, p.dir || '.')
+        if (isUnder(abs)) {
+          // 自愈：早期服务 cwd 错误，把工作区建到了配置目录(.miniagent)下。
+          // 迁回项目根下的同名目录，使"建项目时指定的文件夹"真正生效，
+          // 避免再次因 .miniagent 是受保护片段而被安全网关拦截。
+          const src = (abs.toLowerCase() === legacyCfg.toLowerCase() || abs.toLowerCase().startsWith(legacyCfg.toLowerCase() + path.sep)) ? legacyCfg : cfgDir
+          const rel = path.relative(src, abs)
+          abs = path.resolve(this.baseDir, rel || 'workspace')
+          p.dir = abs
+          changed = true
+          continue
+        }
         // 把仍指向仓库根的「默认项目」迁移到 workspace 子文件夹（防止产物落在源码根）
         if (p.id === 'default' && abs === this.baseDir) {
           p.dir = defaultWs

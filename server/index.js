@@ -24,6 +24,7 @@ import { registerXlsxOps } from './tools/xlsx-ops.js'
 import { registerPdfOps } from './tools/pdf-ops.js'
 import { registerShell } from './tools/shell.js'
 import { registerScriptOps } from './tools/script-ops.js'
+import { registerOrganizeOps } from './tools/organize-ops.js'
 import { MCPClient } from './mcp/client.js'
 import { SkillsManager } from './skills/loader.js'
 import { installSkillFromZip } from './skills/install.js'
@@ -33,8 +34,27 @@ import { analyzeImage, generateImage } from './agnes.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PORT = process.env.PORT || 3000
-const BASE_DIR = process.env.WORK_DIR || process.cwd()
-const CONFIG_DIR = process.env.CONFIG_DIR || path.join(process.env.HOME || process.env.USERPROFILE, '.miniagent')
+// 服务端"工作区根"恒定为 MiniAgent 项目根目录（server/ 的上一级），
+// 不再依赖进程启动时的 cwd。这样新建项目时指定的文件夹（相对名）会正确解析到
+// 项目根下，而不是落到启动目录（早期误解析到 ~/.miniagent 的根因）。
+// 如需自定义工作区根，可设环境变量 WORK_DIR 覆盖。
+const BASE_DIR = process.env.WORK_DIR || path.resolve(__dirname, '..')
+// 配置目录（存放 workspace.json / models.json / mcp.json / skills 等）：
+// 默认落在用户级 ~/.miniagent，与项目源码/工作区严格分离；且 .miniagent 本身是安全网关的
+// 受保护片段，可防止 agent 自毁配置。
+// 防回归：配置目录绝不能与工作区根（BASE_DIR）重合或落在其下 —— 否则安全网关会把整个项目根
+// 当成"agent 配置目录"而拦截所有写操作（早期曾把 CONFIG_DIR 误指到项目根，导致文档写不进工作区）。
+// 若外部强行把 CONFIG_DIR 指到项目根或项目根之下，这里回落到用户级 ~/.miniagent。
+let CONFIG_DIR = process.env.CONFIG_DIR || path.join(process.env.HOME || process.env.USERPROFILE, '.miniagent')
+{
+  const _base = path.resolve(BASE_DIR)
+  const _cfg = path.resolve(CONFIG_DIR)
+  if (_cfg === _base || _cfg.startsWith(_base + path.sep)) {
+    CONFIG_DIR = path.join(process.env.HOME || process.env.USERPROFILE, '.miniagent')
+  }
+}
+// 让安全网关等其它模块读到的 CONFIG_DIR 与这里保持一致（默认 ~/.miniagent）。
+process.env.CONFIG_DIR = CONFIG_DIR
 
 // ── 初始化组件 ──────────────────────────────────────────────────
 
@@ -70,10 +90,12 @@ registerPdfOps(tools, { getBaseDir })
 // 注意：这两个 register 若漏调，命令能力会整体消失（此前回归过一次）。
 registerShell(tools, { getBaseDir, getPermissionMode })
 registerScriptOps(tools, { getBaseDir, getPermissionMode })
+// 文件整理：scan_directory（聚合扫描）+ batch_organize（批量移动/复制，默认 dryRun 预览）
+registerOrganizeOps(tools, { getBaseDir })
 const mcp = new MCPClient(CONFIG_DIR)
 const skills = new SkillsManager(CONFIG_DIR)
 const modelManager = new ModelManager(CONFIG_DIR)
-const workspace = new WorkspaceManager(BASE_DIR, CONFIG_DIR)
+const workspace = new WorkspaceManager(CONFIG_DIR, BASE_DIR)
 const clients = new Set() // 活跃 WebSocket 连接，用于事件广播
 let engine = null
 

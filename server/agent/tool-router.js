@@ -24,7 +24,7 @@ export const TOOL_GROUPS = {
     'list_files', 'read_file', 'write_file', 'search_files', 'create_dir', 'move_file',
   ],
   file: [
-    'file_info', 'copy_file', 'append_file', 'delete_file',
+    'file_info', 'scan_directory', 'copy_file', 'append_file', 'batch_organize', 'delete_file',
   ],
   command: [
     'run_command', 'run_script',
