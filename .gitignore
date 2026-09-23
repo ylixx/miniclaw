@@ -26,3 +26,6 @@ yarn-error.log*
 Thumbs.db
 .idea/
 .vscode/
+
+# Runtime app data (projects/tasks state), do not track
+/workspace.json
