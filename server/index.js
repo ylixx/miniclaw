@@ -248,6 +248,7 @@ app.get('/api/status', (req, res) => {
     model: active ? { name: active.name, model: active.model, provider: active.provider } : null,
     activeTaskId: workspace.activeTaskId,
     activeTaskTitle: activeTask?.title || null,
+    activeProjectId: workspace.activeProjectId,
     projects: workspace.listProjects(),
   })
 })
@@ -285,6 +286,16 @@ app.delete('/api/projects/:id', async (req, res) => {
   }
 })
 
+// 切换/激活项目：设置 activeProjectId + 清激活任务（软切换上下文），落盘后前端刷新仍保持
+app.post('/api/projects/:id/activate', async (req, res) => {
+  try {
+    const project = await workspace.setActiveProject(req.params.id)
+    res.json({ success: true, activeProjectId: workspace.activeProjectId, activeTaskId: workspace.activeTaskId, project })
+  } catch (err) {
+    res.status(400).json({ error: err.message })
+  }
+})
+
 // ── 任务管理 API ──────────────────────────────────────────────
 
 app.get('/api/projects/:id/tasks', async (req, res) => {
@@ -299,6 +310,8 @@ app.get('/api/projects/:id/tasks', async (req, res) => {
 app.post('/api/projects/:id/tasks', async (req, res) => {
   try {
     const task = await workspace.createTask(req.params.id, req.body)
+    // 新建任务 = 全新上下文：绑定空历史，避免 engine 残留上一个任务（可能属于另一个项目）的对话
+    await engine.bindTask(task.id)
     res.json({ success: true, task })
   } catch (err) {
     res.status(400).json({ error: err.message })

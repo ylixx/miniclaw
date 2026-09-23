@@ -45,9 +45,9 @@ async function loadStatus() {
     // 项目
     if (data.projects && data.projects.length > 0) {
       if (!currentProjectId || !data.projects.find(p => p.id === currentProjectId)) {
-        // 优先选激活任务所在项目，否则第一个
-        const activeTask = data.projects.find(p => p.taskCount > 0) || data.projects[0]
-        currentProjectId = activeTask.id
+        // 优先用后端持久化的激活项目（刷新后保持用户切换结果），否则第一个项目（向后兼容）
+        currentProjectId = (data.activeProjectId && data.projects.find(p => p.id === data.activeProjectId)?.id)
+          || data.projects[0].id
       }
       renderProjectName(data.projects)
       await loadTasks()
@@ -94,12 +94,39 @@ async function loadProjectsList() {
 }
 
 async function selectProject(id) {
+  let name = id
+  try {
+    const res = await fetch(`${API}/api/projects/${id}/activate`, { method: 'POST' })
+    const data = await res.json()
+    if (data.error) return alert(`切换失败: ${data.error}`)
+    if (data.project?.name) name = data.project.name
+  } catch (e) {
+    console.error('activate project failed:', e)
+    return alert('切换失败：服务端未响应（请确认后端已加载新代码并重启）')
+  }
+  // 切换项目 = 切换上下文：清掉当前任务，下一次对话会在新项目下建任务
   currentProjectId = id
   currentTaskId = null
-  await loadTasks()
   await loadProjectsList()
+  await loadTasks()
   await loadStatus()
   renderChatTitle()
+  showToast(`已切换到「${name}」`)
+}
+
+// 轻量顶部提示（非阻塞，2 秒自动淡出）
+function showToast(msg) {
+  let t = document.getElementById('wb-toast')
+  if (!t) {
+    t = document.createElement('div')
+    t.id = 'wb-toast'
+    t.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);background:#1f2937;color:#fff;padding:8px 16px;border-radius:8px;z-index:9999;opacity:0;transition:opacity .25s;pointer-events:none;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.25)'
+    document.body.appendChild(t)
+  }
+  t.textContent = msg
+  t.style.opacity = '1'
+  clearTimeout(t._timer)
+  t._timer = setTimeout(() => { t.style.opacity = '0' }, 2000)
 }
 
 async function createProject() {

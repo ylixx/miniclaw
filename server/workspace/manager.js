@@ -23,6 +23,7 @@ export class WorkspaceManager {
     this.baseDir = baseDir
     this.projects = []
     this.activeTaskId = null
+    this.activeProjectId = null
     this._writeLock = Promise.resolve()
   }
 
@@ -31,6 +32,7 @@ export class WorkspaceManager {
       const data = JSON.parse(await fs.readFile(this.storeFile, 'utf-8'))
       this.projects = data.projects || []
       this.activeTaskId = data.activeTaskId || null
+      this.activeProjectId = data.activeProjectId || null
     } catch {
       this.projects = []
     }
@@ -95,6 +97,7 @@ export class WorkspaceManager {
       await fs.writeFile(tmp, JSON.stringify({
         projects: this.projects,
         activeTaskId: this.activeTaskId,
+        activeProjectId: this.activeProjectId,
       }, null, 2))
       await fs.rename(tmp, this.storeFile)
     }
@@ -257,9 +260,12 @@ export class WorkspaceManager {
   }
 
   /**
-   * 返回当前激活任务所属项目的绝对工作目录。
-   * 无激活任务时返回首个项目目录，兜底 baseDir。
-   * 供文件/命令工具的 PathGuard 动态作为沙箱根（让"选本地文件夹当工作区"真正生效）。
+   * 返回当前激活上下文的绝对工作目录，优先级：
+   *   1. 激活任务（任务级工作区优先，否则其所属项目工作区）
+   *   2. 激活项目（activeProjectId 指向的项目目录）
+   *   3. 首个项目目录（向后兼容）
+   *   4. baseDir 兜底
+   * 供文件/命令工具的 PathGuard 动态作为沙箱根（让"切换项目/选本地文件夹当工作区"真正生效）。
    */
   getActiveDir() {
     if (this.activeTaskId) {
@@ -270,6 +276,10 @@ export class WorkspaceManager {
         if (td) return path.resolve(this.baseDir, td)
         return path.resolve(this.baseDir, found.project.dir)
       }
+    }
+    if (this.activeProjectId) {
+      const p = this.getProject(this.activeProjectId)
+      if (p) return path.resolve(this.baseDir, p.dir)
     }
     if (this.projects.length) return path.resolve(this.baseDir, this.projects[0].dir)
     return this.baseDir
@@ -283,6 +293,18 @@ export class WorkspaceManager {
   async setActiveTask(taskId) {
     if (taskId !== null && !this.findTask(taskId)) throw new Error(`任务不存在: ${taskId}`)
     this.activeTaskId = taskId
+    await this.save()
+  }
+
+  /**
+   * 设置激活项目（前端"切换项目"落地）。
+   * 切换项目即切换上下文：清掉当前激活任务（避免新对话仍落在旧任务/项目），
+   * 落盘 activeProjectId，使 getActiveDir() 在下次对话时回到该项目目录。
+   */
+  async setActiveProject(projectId) {
+    if (projectId !== null && !this.getProject(projectId)) throw new Error(`项目不存在: ${projectId}`)
+    this.activeProjectId = projectId
+    this.activeTaskId = null
     await this.save()
   }
 
