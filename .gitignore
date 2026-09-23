@@ -11,6 +11,10 @@ node_modules/
 # 注意：必须是根级 /workspace/，否则会误伤源码目录 server/workspace/
 /workspace/
 
+# 另一个 agent 项目工作区（用户自建项目指向的目录，同为产物，非源码）
+# 同样必须根级，避免误伤
+/aa/
+
 # Logs
 *.log
 npm-debug.log*
