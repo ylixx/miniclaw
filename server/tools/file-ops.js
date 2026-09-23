@@ -14,6 +14,25 @@ import { checkFileOp } from './safety-gate.js'
 const MAX_READ_BYTES = 2 * 1024 * 1024   // 单次读取上限 2MB
 const MAX_WRITE_BYTES = 5 * 1024 * 1024  // 单次写入上限 5MB
 
+// ── 二进制容器格式防护 ─────────────────────────────────────────
+// .docx/.pptx/.xlsx 等 OOXML 文件本质是 zip 包，而 write_file/append_file 只能写纯文本。
+// 把文本写进这些扩展名会产出"伪 docx"，Word 打开即报"发现无法读取的内容"
+// （实测 4B 模型在"排版文档"时经常偷懒这样写，而不是调用 create_docx）。
+// 这里直接拒绝，并在报错里告诉模型正确工具——错误信息会回到模型，形成自我纠正。
+const CONTAINER_HINTS = {
+  '.docx': '生成或排版 Word 请改用 create_docx 工具（blocks 数组描述 heading/paragraph/bullets/table）',
+  '.pptx': '生成或排版 PPT 请改用 create_pptx 工具',
+  '.xlsx': '生成 Excel 请改用表格专用工具，或先落 .csv 再转换',
+  '.zip': '打包 zip 请使用命令行工具',
+}
+function assertNotTextToContainer(target, op) {
+  const hint = CONTAINER_HINTS[path.extname(target).toLowerCase()]
+  if (!hint) return
+  throw new Error(
+    `拒绝${op}：该扩展名是二进制容器格式（zip 包），不能用纯文本写入，否则 Office 将无法打开。${hint}。若只是要保存文本内容，请改用 .txt 或 .md 扩展名。`
+  )
+}
+
 export function registerFileOps(registry, { getBaseDir, getPermissionMode } = {}) {
   // 实时读取权限模式（支持模型切换后动态生效）：unattended 跳过 delete_file 二次确认
   const getMode = () => (getPermissionMode && getPermissionMode()) || 'guarded'  // guarded | read-only | unattended
@@ -81,7 +100,7 @@ export function registerFileOps(registry, { getBaseDir, getPermissionMode } = {}
   // ── 写入文件 ────────────────────────────────────────────────
   registry.register({
     name: 'write_file',
-    description: '创建或覆盖文件（内容最多 5MB）',
+    description: '创建或覆盖文本文件（内容最多 5MB）。注意：不能写 .docx/.pptx/.xlsx 等二进制格式——生成 Word 用 create_docx，生成 PPT 用 create_pptx',
     parameters: {
       type: 'object',
       properties: {
@@ -95,6 +114,7 @@ export function registerFileOps(registry, { getBaseDir, getPermissionMode } = {}
       if (deny) return { error: '安全拦截：' + deny, needConfirm: true, code: 'DENIED' }
       const { guard, rel } = getCtx()
       const target = guard.resolve(filePath)
+      assertNotTextToContainer(target, '写入')
       if (typeof content !== 'string') throw new Error('content 必须是字符串')
       if (content.length > MAX_WRITE_BYTES) {
         throw new Error(`内容过大（${content.length} 字节），超过写入上限`)
@@ -122,6 +142,7 @@ export function registerFileOps(registry, { getBaseDir, getPermissionMode } = {}
       if (deny) return { error: '安全拦截：' + deny, needConfirm: true, code: 'DENIED' }
       const { guard, rel } = getCtx()
       const target = guard.resolve(filePath)
+      assertNotTextToContainer(target, '追加')
       await fs.mkdir(path.dirname(target), { recursive: true })
       await fs.appendFile(target, content, 'utf-8')
       return { success: true, path: rel(target) }

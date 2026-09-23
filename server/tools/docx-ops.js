@@ -218,7 +218,9 @@ export function registerDocxOps(registry, { getBaseDir } = {}) {
               if (decoded.includes(find)) {
                 const replaced = decoded.split(find).join(replace)
                 total += decoded.split(find).length - 1
-                return full.replace(inner, encodeXml(replaced))
+                // 用函数形式做 replacement：字符串形式会特殊解释 $&/$' 等 $ 序列，
+                // 替换文本含 $ 时会产出损坏的 XML
+                return full.replace(inner, () => encodeXml(replaced))
               }
               return full
             })
