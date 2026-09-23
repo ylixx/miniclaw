@@ -27,7 +27,7 @@ export const TOOL_GROUPS = {
     'file_info', 'copy_file', 'append_file', 'delete_file',
   ],
   command: [
-    'run_command',
+    'run_command', 'run_script',
   ],
   data: [
     'read_csv', 'read_json', 'md_table', 'text_stats',
@@ -106,7 +106,7 @@ export const INTENT_RULES = [
   },
   {
     group: 'command',
-    kw: ['运行', '执行', '编译', '命令行', '终端', 'cmd', 'git', 'npm', 'node ', 'python', '启动服务', '端口', 'curl', 'ping'],
+    kw: ['运行', '执行', '编译', '命令行', '终端', 'cmd', 'git', 'npm', 'node ', 'python', '启动服务', '端口', 'curl', 'ping', '脚本', '批量重命名'],
   },
 ]
 

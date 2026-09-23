@@ -66,6 +66,10 @@ registerPptxOps(tools, { getBaseDir })
 registerDocxOps(tools, { getBaseDir })
 registerXlsxOps(tools, { getBaseDir })
 registerPdfOps(tools, { getBaseDir })
+// 命令类：run_command（单条命令）与 run_script（多行脚本），两者都受 safety-gate 管控。
+// 注意：这两个 register 若漏调，命令能力会整体消失（此前回归过一次）。
+registerShell(tools, { getBaseDir, getPermissionMode })
+registerScriptOps(tools, { getBaseDir, getPermissionMode })
 const mcp = new MCPClient(CONFIG_DIR)
 const skills = new SkillsManager(CONFIG_DIR)
 const modelManager = new ModelManager(CONFIG_DIR)

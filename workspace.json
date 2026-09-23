@@ -1,0 +1,12 @@
+{
+  "projects": [
+    {
+      "id": "default",
+      "name": "默认项目",
+      "dir": "C:\\Users\\LiJiaLu\\.miniagent\\workspace",
+      "createdAt": "2026-09-23T09:00:11.548Z",
+      "tasks": []
+    }
+  ],
+  "activeTaskId": null
+}
