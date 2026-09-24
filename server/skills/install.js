@@ -10,7 +10,7 @@ import fs from 'fs/promises'
 import fssync from 'fs'
 import os from 'os'
 import path from 'path'
-import { execFileSync } from 'child_process'
+import { execFile } from 'child_process'
 
 // 递归列出目录下所有文件
 function walk(dir, out = []) {
@@ -97,7 +97,14 @@ export async function installSkillFromZip(zipBuffer, skillsManager) {
   try {
     // Windows 内置解压，免依赖；路径用单引号包裹并转义内部单引号
     const ps = `Expand-Archive -Path '${zipPath.replace(/'/g, "''")}' -DestinationPath '${outDir.replace(/'/g, "''")}' -Force`
-    execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { stdio: 'ignore' })
+    // 异步解压：此前用 execFileSync 同步阻塞 Node 事件循环，安装 15MB zip 期间
+    // 整个服务（含正在进行的对话）会卡死。改为 async execFile 不阻塞。
+    await new Promise((resolve, reject) => {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { stdio: 'ignore' }, (err) => {
+        if (err) reject(err)
+        else resolve()
+      })
+    })
 
     const skill = findEntry(outDir)
 

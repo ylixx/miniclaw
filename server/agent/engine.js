@@ -182,11 +182,14 @@ export class AgentEngine {
             } else {
               // 子集外工具：先解析（模糊纠名），存在即自动扩容，避免"省 token"变成"任务卡死"
               const resolved = this.tools.resolveName ? this.tools.resolveName(name) : name
-              if (!resolved || !this._ensureTool(resolved)) {
-                result = {
-                  error: `未知工具: ${name}。当前可用: ${this._scope.names.join ? [...this._scope.names].join(', ') : ''}`,
-                  code: 'TOOL_NOT_FOUND',
-                }
+              const knownTools = [...(this._scope?.names || [])].join(', ')
+              if (!resolved) {
+                result = { error: `未知工具: ${name}。当前可用: ${knownTools}`, code: 'TOOL_NOT_FOUND' }
+              } else if (!this._ensureTool(resolved)) {
+                // _ensureTool 拒绝：read-only 模式下 = 白名单外拒绝；其余情况 = schema 缺失
+                result = this.permissionMode === 'read-only'
+                  ? { error: `当前为 read-only 模式，工具「${name}」不在只读白名单内，禁止执行。`, code: 'PERMISSION_MODE' }
+                  : { error: `未知工具: ${name}。当前可用: ${knownTools}`, code: 'TOOL_NOT_FOUND' }
               } else {
                 result = await this.tools.execute(resolved, args)
                 if (result && result.isError) {
@@ -216,7 +219,7 @@ export class AgentEngine {
             }
           }
 
-          const resultText = buildToolResult(result)
+          const resultText = buildToolResult(result, name)
           steps.push({ tool: name, args, result: resultText })
 
           // 记录工具结果

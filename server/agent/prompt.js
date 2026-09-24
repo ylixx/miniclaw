@@ -20,9 +20,12 @@ export function buildPrompt({ history, tools, skills, config, workDir, skillCont
   const systemPrompt = buildSystemPrompt(tools, skills, config, workDir, skillContext, plan, selfVerifyHint, toolScope)
   messages.push({ role: 'system', content: systemPrompt })
 
-  // 2. 对话历史（已裁剪，保序）
+  // 2. 对话历史（已裁剪，保序）。
+  //    历史中的 system 消息是引擎运行中注入的动态反馈（[格式错误] 纠错回灌、
+  //    [进度提示] 等），必须透传给模型——此前这里一刀切过滤，导致纠错机制整个失效
+  //    （模型看不到错误详情和格式示例，只会盲目重试）。
+  //    顶层 system prompt 仍由 buildSystemPrompt 统一构建，与此互不冲突。
   for (const msg of history) {
-    if (msg.role === 'system') continue // system 指令统一收口在顶部，避免重复
     messages.push(msg)
   }
 
@@ -141,13 +144,32 @@ function describeTool(t) {
 
 /**
  * 构建工具结果消息
+ * @param {*} result 工具原始返回值
+ * @param {string} [toolName] 工具名，用于区分读类工具（放宽截断、直接吐正文）
+ *
+ * 修复 P1-9：此前对所有结果一刀切 JSON.stringify 后 slice(0,1500)，而 read_file
+ * 等读类工具返回 {content,totalLines,truncated}，导致模型只能看到约 1400 字符且是
+ * JSON 字符串的中段截断（引号不闭合）。读类工具是办公 Agent 的核心场景，这里直接
+ * 吐出正文（放宽到 5000），其余工具保持紧凑上限省 token。
  */
-export function buildToolResult(result) {
+const RESULT_LIMIT = 1500
+const RESULT_LIMIT_READ = 5000
+const READ_TOOL_RE = /^read_/i
+
+export function buildToolResult(result, toolName = '') {
   if (result === null || result === undefined) return '执行成功，无返回结果'
-  if (typeof result === 'string') return result.slice(0, 1500)
+  if (typeof result === 'string') return result.slice(0, RESULT_LIMIT_READ)
+  // 读类工具：直接吐正文，避免 JSON 包裹导致中段截断、引号不闭合
+  if (toolName && READ_TOOL_RE.test(toolName) && result && typeof result.content === 'string') {
+    const c = result.content
+    if (c.length <= RESULT_LIMIT_READ) return c
+    return `${c.slice(0, RESULT_LIMIT_READ)}\n…（结果过长已截断，共 ${c.length} 字符；可用 offset/limit 分段读取）`
+  }
   try {
-    return JSON.stringify(result).slice(0, 1500)
+    const s = JSON.stringify(result)
+    if (s.length <= RESULT_LIMIT) return s
+    return `${s.slice(0, RESULT_LIMIT)}\n…（结果过长已截断，共 ${s.length} 字符）`
   } catch {
-    return String(result).slice(0, 1500)
+    return String(result).slice(0, RESULT_LIMIT)
   }
 }

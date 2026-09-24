@@ -52,6 +52,7 @@ export class MCPClient {
     this.configFile = path.join(configDir, 'mcp.json')
     this.servers = new Map()     // name -> { name, config, transport, tools, connected, error }
     this.pending = new Map()     // requestId -> {resolve, reject, timer}
+    this._writeLock = Promise.resolve() // 串行化写入，防止并发/断电损坏
   }
 
   // ── 配置持久化 ─────────────────────────────────────────────
@@ -76,13 +77,19 @@ export class MCPClient {
   }
 
   async save() {
-    await fs.mkdir(this.configDir, { recursive: true })
-    await fs.writeFile(this.configFile, JSON.stringify({
-      servers: Array.from(this.servers.values()).map(s => ({
-        name: s.name,
-        config: s.config,
-      })),
-    }, null, 2))
+    const run = async () => {
+      await fs.mkdir(this.configDir, { recursive: true })
+      const tmp = this.configFile + '.tmp'
+      await fs.writeFile(tmp, JSON.stringify({
+        servers: Array.from(this.servers.values()).map(s => ({
+          name: s.name,
+          config: s.config,
+        })),
+      }, null, 2))
+      await fs.rename(tmp, this.configFile)
+    }
+    this._writeLock = this._writeLock.then(run, run)
+    return this._writeLock
   }
 
   // ── 服务器管理 ─────────────────────────────────────────────

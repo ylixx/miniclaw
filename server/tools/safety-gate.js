@@ -13,6 +13,8 @@
 import path from 'path'
 
 // 危险命令/参数模式（命令执行类，适用于 MCP stdio 命令与未来的 shell 工具）
+// 同时覆盖 Linux 与 Windows 视角：此前名单只有 Linux（rm/chmod/su），导致在 Windows 上
+// 运行的项目对 rd /s /q、del /f /s /q、Remove-Item、IEX(...) 等完全不设防。
 const DENY_COMMAND_PATTERNS = [
   /\bcurl\b[^]*\|\s*(?:sh|bash)\b/i,          // curl ... | sh
   /\bwget\b[^]*\|\s*(?:sh|bash)\b/i,          // wget ... | sh
@@ -29,6 +31,14 @@ const DENY_COMMAND_PATTERNS = [
   /\bchown\b[^]*-R\b/i,                        // chown -R
   /:\s*\(\)\s*\{[^]*;\s*;\s*\}/i,             // fork bomb :(){ :|:& };:
   /\brm\b[^]*-rf\b[^]*\//i,                    // rm -rf /（根/绝对路径递归删）
+  // ── Windows 视角（项目仅运行在 Windows）──
+  /\brd\b[^]*\/[sq]\b/i,                        // rd /s /q 递归静默删目录（含 rd /s C:\）
+  /\bdel\b[^]*\/[fsq]\b/i,                      // del /f /s /q 强制递归静默删文件
+  /\bRemove-Item\b[^]*(?:-[rR]|-[fF]orce|-Recurse)/i, // Remove-Item -Recurse -Force
+  /\biex\b\s*\(/i,                             // IEX(...) 执行任意字符串代码
+  /\bInvoke-Expression\b/i,                     // PowerShell 别名：Invoke-Expression
+  /\bformat\s+[a-z]:/i,                         // format C: 格式化磁盘
+  /(?:>>?|>)\s*[^|]*\.(?:git|miniagent)\b/i,    // 重定向覆写 .git / 配置目录（受保护路径对命令类工具的补充）
 ]
 
 // 工作区内受保护目录片段（命中即拒绝破坏性操作）
@@ -41,9 +51,12 @@ const PROTECTED_FRAGMENTS = ['.git', '.miniagent']
 export const PERMISSION_MODES = ['guarded', 'read-only', 'unattended']
 
 // 受 read-only 模式管控的「写 / 删」类工具（覆盖内置文件工具与常见 shell 工具名）
+// run_script：写脚本文件并执行，属写+执行双重危险操作；
+// batch_organize：批量移动/复制文件，属写操作。
 const MUTATING_TOOLS = new Set([
   'write_file', 'append_file', 'delete_file', 'move_file', 'copy_file',
   'create_dir', 'create_file', 'shell_exec', 'run_command', 'exec',
+  'run_script', 'batch_organize',
 ])
 
 function defaultConfigDir() {
@@ -112,7 +125,13 @@ export function checkFileOp(name, args = {}, configDir) {
  */
 export function checkPermissionMode(mode, name) {
   if (!mode || mode === 'guarded' || mode === 'unattended') return null
-  if (mode === 'read-only' && MUTATING_TOOLS.has(name)) {
+  if (mode !== 'read-only') return null
+  // MCP 工具的读写性质无法静态判定（服务器端 schema 不可信），deny-first 一律拦截。
+  // 此前 MCP 工具名不在 MUTATING_TOOLS 里，read-only 模式对它们完全不设防。
+  if (name && String(name).startsWith('mcp__')) {
+    return `当前为 read-only 模式，禁止执行 MCP 工具「${name}」（无法静态判定其读写性质）`
+  }
+  if (MUTATING_TOOLS.has(name)) {
     return `当前为 read-only 模式，禁止执行写/删类工具「${name}」`
   }
   return null

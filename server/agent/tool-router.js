@@ -150,7 +150,11 @@ export function selectTools({ schemas = [], activeSkills = [], message = '', per
   for (const h of hits.slice(0, MAX_INTENT_GROUPS)) addGroup(h.group)
 
   // 4. MCP 工具始终注入（数量少，且是用户显式接入的能力）
-  for (const s of schemas) if (s.mcp) picked.add(s.name)
+  //    read-only 除外：无法静态判定 MCP 工具的读写性质，deny-first 不注入
+  //    （即使被注入，引擎层 checkPermissionMode 也会拦截 mcp__* 工具）。
+  if (permissionMode !== 'read-only') {
+    for (const s of schemas) if (s.mcp) picked.add(s.name)
+  }
 
   // 5. 截断：core + 技能组优先保留，意图组按分数从低到高让位（组内从尾部砍，保关键工具）
   const limit = activeSkills.length ? MAX_TOOLS_WITH_SKILL : MAX_TOOLS

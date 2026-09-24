@@ -119,7 +119,28 @@ async function syncMCPTools() {
 // ── Express 应用 ────────────────────────────────────────────────
 
 const app = express()
-app.use(cors())
+// ── 跨域策略（安全）────────────────────────────────────────────
+// 本工具是能执行任意命令的本地服务，默认只允许同源 / 本机（localhost / 127.0.0.1）
+// 访问，杜绝本机浏览器里打开的其他网页跨域驱动 agent。若需局域网访问设 ALLOW_LAN=1。
+// 若设了 LOCAL_TOKEN，则所有 API 必须携带 x-api-token 头（默认不开启，避免破坏内置 SPA）。
+const _localOrigin = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/
+const LOCAL_TOKEN = process.env.LOCAL_TOKEN || ''
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true) // 同源 / curl / 桌面壳 fetch 通常不带 Origin
+    if (_localOrigin.test(origin)) return cb(null, true)
+    if (process.env.ALLOW_LAN === '1' && /^https?:\/\/192\.168\.\d+\.\d+(:\d+)?$/.test(origin)) return cb(null, true)
+    cb(new Error('CORS 拒绝：仅允许本机访问'))
+  },
+}))
+if (LOCAL_TOKEN) {
+  app.use((req, res, next) => {
+    if (req.method === 'OPTIONS') return next()
+    if (req.path === '/' || req.path.startsWith('/login')) return next()
+    if (req.headers['x-api-token'] === LOCAL_TOKEN) return next()
+    return res.status(401).json({ error: '需要本地令牌：x-api-token' })
+  })
+}
 // 体积上限放宽到 32mb，以容纳本地图片经 base64 内联上传（图像分析/图生图场景）
 app.use(express.json({ limit: '32mb' }))
 // 前端为开发期静态资源，强制 no-store，避免浏览器缓存旧 app.js/styles.css 导致 UI 改动不生效
@@ -257,6 +278,13 @@ app.get('/api/status', (req, res) => {
 
 app.get('/api/projects', (req, res) => {
   res.json(workspace.listProjects())
+})
+
+// 单个项目详情（含目录）：前端新建任务后回退展示任务工作区时使用
+app.get('/api/projects/:id', (req, res) => {
+  const p = workspace.getProject(req.params.id)
+  if (!p) return res.status(404).json({ error: '项目不存在' })
+  res.json(workspace.listProjects().find(x => x.id === p.id) || p)
 })
 
 app.post('/api/projects', async (req, res) => {
@@ -611,6 +639,13 @@ app.post('/api/mcp/:name/connect', async (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message })
   }
+})
+
+// 一键连接全部已配置的 MCP 服务器（前端「连接全部」按钮）
+app.post('/api/mcp/connect-all', async (req, res) => {
+  const results = await mcp.connectAll()
+  await syncMCPTools()
+  res.json({ success: true, results })
 })
 
 // 断开

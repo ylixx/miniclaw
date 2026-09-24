@@ -432,10 +432,10 @@ async function activateSkill(name) {
       }
     }
   }
-  const ares = await fetch(`${API}/api/skills/${name}/activate`, {
+  const ares = await fetch(`${API}/api/skills/activate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
+    body: JSON.stringify({ name, params }),
   })
   const data = await ares.json()
   if (data.error) return alert(`激活失败: ${data.error}`)
@@ -443,7 +443,11 @@ async function activateSkill(name) {
 }
 
 async function deactivateSkill(name) {
-  await fetch(`${API}/api/skills/${name}/deactivate`, { method: 'POST' })
+  await fetch(`${API}/api/skills/deactivate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
   await loadSkillsFullList()
 }
 
@@ -452,7 +456,7 @@ async function createCustomSkill() {
   const description = $('#skDesc').value.trim()
   const instruction = $('#skInstruction').value.trim()
   if (!name || !instruction) return alert('技能名称和指令必填')
-  const res = await fetch(`${API}/api/skills`, {
+  const res = await fetch(`${API}/api/skills/custom`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, description, instruction }),

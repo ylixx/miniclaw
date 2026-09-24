@@ -15,13 +15,17 @@
  *
  * 安全保障：
  * 1. 脚本文件名强制以 .sh/.bat/.ps1 结尾，防止任意扩展名
- * 2. 脚本内容通过 write_file 的 PathGuard 解析，工作区锁定
- * 3. 执行命令通过 run_command 的 deny-first 黑名单 + 权限模式闸
- * 4. 脚本执行完由 LLM 决定是否清理（不强制清理，避免误删）
+ * 2. 脚本文件名过 checkFileOp 受保护路径检查（.git / 配置目录），并经 PathGuard
+ *    解析为工作区内绝对路径（防 ../ 目录穿越）后才写盘
+ * 3. 脚本内容过 deny-first 黑名单（脚本体就是将要执行的命令，与 run_command 同级管控）
+ * 4. 执行命令过 deny-first 黑名单 + 权限模式闸（read-only 拦截，run_script 在 MUTATING_TOOLS）
+ * 5. 所有检查通过后才写脚本文件，执行完由 LLM 决定是否清理（不强制清理，避免误删）
  */
 
 import { spawn } from 'child_process'
-import { checkCommandLine, checkPermissionMode } from './safety-gate.js'
+import path from 'path'
+import { checkCommandLine, checkPermissionMode, checkFileOp } from './safety-gate.js'
+import { PathGuard } from './path-guard.js'
 
 const DEFAULT_TIMEOUT = 30      // 秒
 const MAX_TIMEOUT = 120         // 秒
@@ -62,49 +66,60 @@ export function registerScriptOps(registry, { getBaseDir, getPermissionMode } = 
         return { error: 'filename 必须是非空字符串', code: 'VALIDATION' }
       }
 
-      const ext = (filename.trim().toLowerCase().split(/[\\/]/).pop() || '').match(/\.(sh|bat|ps1)$/i)?.[0] || '.sh'
+      // 扩展名白名单：不匹配直接拒绝（此前 || '.sh' 兜底会把 evil.exe 当成 .sh 放行）
+      const ext = (filename.trim().toLowerCase().split(/[\\/]/).pop() || '').match(/\.(sh|bat|ps1)$/i)?.[0]
       const validExts = ['.sh', '.bat', '.ps1']
-      if (!validExts.includes(ext)) {
-        return { error: `文件扩展名必须是 ${validExts.join(' 或 ')}，当前为 ${ext}`, code: 'VALIDATION' }
+      if (!ext || !validExts.includes(ext)) {
+        return { error: `文件扩展名必须是 ${validExts.join(' 或 ')}，当前为 ${path.basename(filename.trim()) || '(空)'}`, code: 'VALIDATION' }
       }
 
-      // 2) 权限模式闸（read-only 禁止执行）
+      // 2) 权限模式闸（read-only 禁止执行；run_script 已列入 MUTATING_TOOLS）
       const perm = checkPermissionMode(getMode(), 'run_script')
       if (perm) return { error: '安全拦截：' + perm, code: 'DENIED' }
 
+      // 3) 脚本内容过 deny-first 黑名单：脚本体就是将要执行的命令，
+      //    只检查执行命令行的话，任何被 run_command 拒绝的命令（curl|sh、sudo、dd...）
+      //    写进脚本即可绕过，黑名单形同虚设。
+      const denyScript = checkCommandLine(script)
+      if (denyScript) return { error: '安全拦截（脚本内容）：' + denyScript, code: 'DENIED' }
+
+      // 4) 受保护路径检查（.git / agent 配置目录等）+ PathGuard 解析写目标。
+      //    此前用 `${baseDir}/${filename}` 裸拼接写文件：filename 含 ../ 即可穿越到
+      //    工作区外任意位置写文件，且完全绕过 PathGuard 与 checkFileOp。
+      const denyPath = checkFileOp('write_file', { path: filename })
+      if (denyPath) return { error: '安全拦截：' + denyPath, needConfirm: true, code: 'DENIED' }
+
       const baseDir = getBaseDir()
-      const scriptPath = `${baseDir}/${filename}`
+      const guard = new PathGuard(baseDir)
+      const scriptPath = await guard.resolveChecked(filename.trim(), { mustExist: false, allowDir: false })
 
-      // 3) 直接写入脚本文件（简化版，避免循环依赖）
-      // 这里直接写入文件，实际生产环境应该调用 write_file 工具
-      const fs = await import('fs')
-      await fs.promises.mkdir(baseDir, { recursive: true })
-      await fs.promises.writeFile(scriptPath, script, 'utf8')
-
-      // 4) 确定执行命令（若未提供）
+      // 5) 确定执行命令（若未提供），并过黑名单
       let execCmd = command
       if (!execCmd) {
         switch (ext) {
           case '.sh':
-            execCmd = `bash ${filename}`
+            execCmd = `bash "${filename.trim()}"`
             break
           case '.bat':
-            execCmd = `cmd /c ${filename}`
+            execCmd = `cmd /c "${filename.trim()}"`
             break
           case '.ps1':
-            execCmd = `powershell -ExecutionPolicy Bypass -File ${filename}`
+            execCmd = `powershell -ExecutionPolicy Bypass -File "${filename.trim()}"`
             break
           default:
             return { error: `无法推断执行命令，请显式提供 command 参数，当前扩展名 ${ext}`, code: 'VALIDATION' }
         }
       }
-
-      // 5) 用 run_command 执行脚本（deny-first 黑名单 + 超时保护）
-      const tSec = Math.max(1, Math.min(MAX_TIMEOUT, Number(timeout) || DEFAULT_TIMEOUT))
-
-      // 安全检查：执行命令本身不能包含危险指令
       const deny = checkCommandLine(execCmd)
       if (deny) return { error: '安全拦截：' + deny, code: 'DENIED' }
+
+      // 6) 全部检查通过后才落盘写脚本
+      const fs = await import('fs')
+      await fs.promises.mkdir(path.dirname(scriptPath), { recursive: true })
+      await fs.promises.writeFile(scriptPath, script, 'utf8')
+
+      // 7) 执行脚本（deny-first 黑名单 + 超时保护）
+      const tSec = Math.max(1, Math.min(MAX_TIMEOUT, Number(timeout) || DEFAULT_TIMEOUT))
 
       return new Promise((resolve) => {
         let stdout = ''

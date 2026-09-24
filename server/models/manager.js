@@ -77,6 +77,7 @@ export class ModelManager {
     this.configFile = path.join(configDir, CONFIG_FILE)
     this.models = []
     this.activeModelId = null
+    this._writeLock = Promise.resolve() // 串行化写入，防止并发/断电损坏
   }
 
   /**
@@ -114,14 +115,20 @@ export class ModelManager {
   }
 
   /**
-   * 保存配置
+   * 保存配置（原子写 + 串行锁，防止并发/断电损坏，对齐 workspace/manager.js）
    */
   async save() {
-    await fs.mkdir(this.configDir, { recursive: true })
-    await fs.writeFile(this.configFile, JSON.stringify({
-      models: this.models,
-      activeModelId: this.activeModelId,
-    }, null, 2))
+    const run = async () => {
+      await fs.mkdir(this.configDir, { recursive: true })
+      const tmp = this.configFile + '.tmp'
+      await fs.writeFile(tmp, JSON.stringify({
+        models: this.models,
+        activeModelId: this.activeModelId,
+      }, null, 2))
+      await fs.rename(tmp, this.configFile)
+    }
+    this._writeLock = this._writeLock.then(run, run)
+    return this._writeLock
   }
 
   /**
@@ -171,7 +178,11 @@ export class ModelManager {
   async update(id, updates) {
     const idx = this.models.findIndex(m => m.id === id)
     if (idx === -1) throw new Error(`Model not found: ${id}`)
-    this.models[idx] = { ...this.models[idx], ...updates, id }
+    const patch = { ...updates }
+    // 空串 / 掩码值 = 未修改（编辑表单不回填已保存的 Key，list() 也只返回 '***'），
+    // 跳过这两个值，避免"改个名字就把 apiKey 清空/覆盖成掩码"导致模型失效。
+    if (patch.apiKey === '' || patch.apiKey === '***') delete patch.apiKey
+    this.models[idx] = { ...this.models[idx], ...patch, id }
     await this.save()
     return this.models[idx]
   }

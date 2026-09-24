@@ -28,6 +28,24 @@ export class PathGuard {
    */
   constructor(baseDir) {
     this.baseDir = path.resolve(baseDir)
+    // 惰性归一化的真实根路径：Windows 上 baseDir 可能是 8.3 短路径（如 ADMINI~1），
+    // 而 fs.realpath 返回长路径（Administrator），前缀比对会把合法路径误判为越界。
+    // 注意 fs.realpathSync 不展开短路径，必须用异步 fs.realpath。
+    this._realBase = null
+  }
+
+  /**
+   * baseDir 的真实路径（首次调用时解析并缓存）；解析失败回退 baseDir 本身
+   */
+  async _getRealBase() {
+    if (!this._realBase) {
+      try {
+        this._realBase = await fs.realpath(this.baseDir)
+      } catch {
+        this._realBase = this.baseDir
+      }
+    }
+    return this._realBase
   }
 
   /**
@@ -56,13 +74,13 @@ export class PathGuard {
   }
 
   /**
-   * 断言路径落在 baseDir 内（防字符串级目录穿越）
+   * 断言路径落在 root 内（防字符串级目录穿越）
    */
-  _assertInside(p) {
-    const rel = path.relative(this.baseDir, p)
+  _assertInside(p, root = this.baseDir) {
+    const rel = path.relative(root, p)
     if (rel !== '' && (rel.startsWith('..') || path.isAbsolute(rel))) {
       throw new PathGuardError(
-        `拒绝访问 ${p}：超出工作目录范围（${this.baseDir}）。请使用工作目录内的相对路径。`
+        `拒绝访问 ${p}：超出工作目录范围（${root}）。请使用工作目录内的相对路径。`
       )
     }
   }
@@ -72,20 +90,22 @@ export class PathGuard {
    */
   async resolveChecked(userPath, { mustExist = true, allowDir = true, allowFile = true } = {}) {
     const resolved = this.resolve(userPath)
+    const realBase = await this._getRealBase()
 
     if (!mustExist) {
       // 写目标可能尚不存在：解析父目录真实路径，再拼回文件名做二次越界校验
       const parent = path.dirname(resolved)
-      try {
-        const realParent = await fs.realpath(parent)
-        this._assertInside(realParent)
+      let realParent = null
+      try { realParent = await fs.realpath(parent) } catch { realParent = null }
+      if (realParent) {
+        // 越界（如父目录是逃逸 symlink）必须抛错拒绝，不能被"父目录不存在"的回退吞掉
+        this._assertInside(realParent, realBase)
         const candidate = path.join(realParent, path.basename(resolved))
-        this._assertInside(candidate)
+        this._assertInside(candidate, realBase)
         return candidate
-      } catch {
-        // 父目录也不存在：无法 realpath，退化为字符串级前缀校验（resolve 已做）
-        return resolved
       }
+      // 父目录不存在：无法 realpath，退化为字符串级前缀校验（resolve 已做）
+      return resolved
     }
 
     let stat
@@ -95,14 +115,15 @@ export class PathGuard {
       throw new PathGuardError(`路径不存在: ${userPath}`, 'PATH_NOT_FOUND')
     }
 
-    // 防 symlink 逃逸：取真实路径做二次越界校验
+    // 防 symlink 逃逸：取真实路径做二次越界校验（用归一化的 realBase 比对，
+    // 避免 Windows 8.3 短路径 vs 长路径造成的误判）
     let realPath
     try {
       realPath = await fs.realpath(resolved)
     } catch {
       realPath = resolved
     }
-    this._assertInside(realPath)
+    this._assertInside(realPath, realBase)
 
     if (stat.isDirectory() && !allowDir) {
       throw new PathGuardError(`这是一个目录，不是文件: ${userPath}`)
