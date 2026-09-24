@@ -20,11 +20,30 @@ async function ensureLibs() {
   return { ExcelJS: _exceljs }
 }
 
-// ── 单元格值归一化：以 = 开头且像公式（其后为字母/括号）则转成公式，否则原值 ──
-function toCellValue(c) {
+// ── 单元格值归一化 ──────────────────────────────────────────────
+// 规则：
+//  1) 以 = 开头且像公式（其后为字母/括号）→ 转成公式对象
+//  2) numericize 开启且字符串为「干净数字」→ 转成 Number（4B 常把 12.5 写成 "12.5"）
+//  3) 防误转：全数字且长度 > 11（电话/长ID）、或带前导 0 的纯数字（编号/代码）→ 保持文本
+function isNumericString(s) {
+  if (!s) return false
+  if (!/^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(s)) return false
+  const digits = s.replace(/[-+.eE]/g, '')
+  if (/^\d+$/.test(digits) && digits.length > 10) return false // 长数字串（11位手机号/长ID）不转
+  if (/^0\d/.test(s)) return false                              // 前导 0 的纯数字（编号/代码）不转
+  return true
+}
+function toCellValue(c, numericize = true) {
   if (c == null) return ''
-  if (typeof c === 'string' && c.startsWith('=') && /^[A-Za-z(]/.test(c.slice(1))) {
-    return { formula: c.slice(1) }
+  if (typeof c === 'string') {
+    const s = c.trim()
+    if (s.startsWith('=') && /^[A-Za-z(]/.test(s.slice(1))) {
+      return { formula: s.slice(1) }
+    }
+    if (numericize && isNumericString(s)) {
+      return Number(s)
+    }
+    return c
   }
   return c
 }
@@ -38,7 +57,7 @@ export function registerXlsxOps(registry, { getBaseDir } = {}) {
   // ── 生成 XLSX ────────────────────────────────────────────────
   registry.register({
     name: 'create_xlsx',
-    description: '根据二维数据生成 Excel(.xlsx)，支持多工作表(sheet)与表头加粗。数据可为二维数组(数组的数组)或对象数组。文件落在当前任务工作区。',
+    description: '根据二维数据生成 Excel(.xlsx)，支持多工作表(sheet)与表头加粗。数据可为二维数组(数组的数组)或对象数组。数字字符串默认转成数值（可用 numericize:false 关闭）；公式以 = 开头自动识别。文件落在当前任务工作区。',
     parameters: {
       type: 'object',
       properties: {
@@ -51,10 +70,11 @@ export function registerXlsxOps(registry, { getBaseDir } = {}) {
         creator: { type: 'string', description: '作者署名，写入文档属性，可选' },
         freezeHeader: { type: 'boolean', description: '是否冻结首行（表头固定不滚动），默认 true' },
         autoWidth: { type: 'boolean', description: '是否按内容自动调整列宽（中文友好），默认 true；设 false 用 Excel 默认列宽' },
+        numericize: { type: 'boolean', description: '是否把“干净的数字字符串”自动转成数值（如 "12.5"→12.5、"-3"→-3），默认 true。会自动跳过电话/长ID（>11位数字）和带前导0的编号（如 "00123"），避免误转；设 false 则全部按文本保留。' },
       },
       required: ['path', 'sheets'],
     },
-    async execute({ path: filePath, sheets, creator, freezeHeader, autoWidth }) {
+    async execute({ path: filePath, sheets, creator, freezeHeader, autoWidth, numericize }) {
       const { ExcelJS } = await ensureLibs()
       // 容错归一化：4B 模型有时会把 sheets 包成 JSON 字符串（双重转义）而非数组，
       // 在此尝试还原，避免直接抛出"必须是非空数组"误导模型。
@@ -101,7 +121,7 @@ export function registerXlsxOps(registry, { getBaseDir } = {}) {
               ws.addRow(row)
             })
           } else {
-            ws.addRow(data.map(toCellValue))
+            ws.addRow(data.map((v) => toCellValue(v, num)))
           }
         }
         // 自动列宽（CJK 友好估算：中文/全角按 2 计）

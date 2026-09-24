@@ -95,12 +95,28 @@ function markdownToBlocks(md) {
   let list = null
   let listType = null
   let table = null
+  let code = null
+  let codeLang = ''
   const flush = () => {
     if (list) { blocks.push({ type: listType, items: list }); list = null; listType = null }
     if (table) { blocks.push({ type: 'table', rows: table }); table = null }
+    if (code != null) { blocks.push({ type: 'code', lang: codeLang, text: code }); code = null; codeLang = '' }
   }
   for (const raw of lines) {
     const line = raw.trim()
+    const fence = /^\s*```(.*)$/.exec(raw)
+    // 代码围栏：进入/退出代码块（围栏内保留原始缩进与空格）
+    if (code != null) {
+      if (line === '```') { flush(); continue }
+      code += (code ? '\n' : '') + raw
+      continue
+    }
+    if (fence) {
+      flush()
+      codeLang = fence[1].trim()
+      code = ''
+      continue
+    }
     const h = /^(#{1,6})\s+(.*)$/.exec(line)
     const isRow = /^\|.*\|$/.test(line)
     const li = /^[-*+]\s+(.*)$/.exec(line)
@@ -149,7 +165,7 @@ export function registerDocxOps(registry, { getBaseDir } = {}) {
         from_md: { type: 'string', description: '推荐：已存在的 .md 文件路径，自动转 docx（与 markdown 二选一）' },
         blocks: {
           type: 'array',
-          description: '结构化内容块数组（markdown/from_md 更简单，优先用它们）。每块: {type, ...}。type 可选 heading(需 text,level 1-6)/paragraph(需 text，支持 **粗** *斜* `代码` 行内格式)/bullets(需 items 字符串数组)/numbered(编号列表，需 items)/table(需 rows 二维数组，首行作表头)/pagebreak(分页符)/image(需 path 工作区内图片路径 或 data: base64 字符串，可选 width/height 像素)。',
+          description: '结构化内容块数组（markdown/from_md 更简单，优先用它们）。每块: {type, ...}。type 可选 heading(需 text,level 1-6)/paragraph(需 text，支持 **粗** *斜* `代码` 行内格式)/bullets(需 items 字符串数组)/numbered(编号列表，需 items)/table(需 rows 二维数组，首行作表头)/code(等宽代码块，需 text 多行代码，可选 lang 语言名)/pagebreak(分页符)/image(需 path 工作区内图片路径 或 data: base64 字符串，可选 width/height 像素)。',
           items: { type: 'object' },
         },
       },
@@ -232,9 +248,20 @@ export function registerDocxOps(registry, { getBaseDir } = {}) {
             const h = Number(b.height) || 320
             children.push(new Paragraph({ children: [new ImageRun({ data: imgData, transformation: { width: w, height: h } })] }))
           }
+        } else if (t === 'code') {
+          // 等宽代码块：逐行渲染，灰色底纹 + Consolas 字体，保留原始缩进
+          const codeText = String(b.text || '')
+          const codeLines = codeText.length ? codeText.split(/\r?\n/) : ['']
+          for (const cl of codeLines) {
+            children.push(new Paragraph({
+              children: [new TextRun({ text: cl.length ? cl : ' ', font: 'Consolas', size: 18 })],
+              shading: { type: 'solid', color: 'auto', fill: 'F2F2F2' },
+              spacing: { before: 0, after: 0, line: 240 },
+            }))
+          }
         } else {
           // paragraph（默认）
-          children.push(new Paragraph({ children: parseInline(b.text).map((r) => new TextRun({ text: String(r.text ?? ''), bold: !!r.bold, italics: !!r.italics })) }))
+          children.push(new Paragraph({ children: parseInline(b.text).map((r) => new TextRun({ text: String(r.text ?? ''), bold: !!r.bold, italics: !!r.italics, font: r.font })) }))
         }
       }
 
