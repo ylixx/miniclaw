@@ -20,6 +20,15 @@ async function ensureLibs() {
   return { ExcelJS: _exceljs }
 }
 
+// ── 单元格值归一化：以 = 开头且像公式（其后为字母/括号）则转成公式，否则原值 ──
+function toCellValue(c) {
+  if (c == null) return ''
+  if (typeof c === 'string' && c.startsWith('=') && /^[A-Za-z(]/.test(c.slice(1))) {
+    return { formula: c.slice(1) }
+  }
+  return c
+}
+
 export function registerXlsxOps(registry, { getBaseDir } = {}) {
   const getCtx = () => {
     const bd = getBaseDir()
@@ -40,10 +49,12 @@ export function registerXlsxOps(registry, { getBaseDir } = {}) {
           items: { type: 'object' },
         },
         creator: { type: 'string', description: '作者署名，写入文档属性，可选' },
+        freezeHeader: { type: 'boolean', description: '是否冻结首行（表头固定不滚动），默认 true' },
+        autoWidth: { type: 'boolean', description: '是否按内容自动调整列宽（中文友好），默认 true；设 false 用 Excel 默认列宽' },
       },
       required: ['path', 'sheets'],
     },
-    async execute({ path: filePath, sheets, creator }) {
+    async execute({ path: filePath, sheets, creator, freezeHeader, autoWidth }) {
       const { ExcelJS } = await ensureLibs()
       // 容错归一化：4B 模型有时会把 sheets 包成 JSON 字符串（双重转义）而非数组，
       // 在此尝试还原，避免直接抛出"必须是非空数组"误导模型。
@@ -55,6 +66,9 @@ export function registerXlsxOps(registry, { getBaseDir } = {}) {
       const target = guard.resolve(filePath)
       if (!target.toLowerCase().endsWith('.xlsx')) throw new Error('文件路径必须以 .xlsx 结尾')
 
+      const freeze = freezeHeader !== false   // 默认冻结首行（表头固定）
+      const autoW = autoWidth !== false       // 默认按内容自动列宽
+
       const wb = new ExcelJS.Workbook()
       wb.creator = creator || 'MiniAgent'
       wb.created = new Date()
@@ -65,28 +79,50 @@ export function registerXlsxOps(registry, { getBaseDir } = {}) {
         // 4B 可能用 data/rows/table/content 任一命名；也可能是字符串化数组，在此归一化
         let data = sh.data ?? sh.rows ?? sh.table ?? sh.content
         if (typeof data === 'string') { try { data = JSON.parse(data) } catch {} }
+        let headerRowCount = 0
         if (Array.isArray(data) && data.length) {
           if (Array.isArray(data[0])) {
             // 二维数组：首行加粗表头
+            headerRowCount = 1
             data.forEach((row, ri) => {
-              const excelRow = ws.addRow(row.map((c) => (c == null ? '' : c)))
+              const excelRow = ws.addRow(row.map(toCellValue))
               if (ri === 0) {
                 excelRow.font = { bold: true }
                 excelRow.alignment = { vertical: 'middle' }
               }
             })
           } else if (typeof data[0] === 'object') {
-            // 对象数组：自动列
-            ws.columns = Object.keys(data[0]).map((k) => ({ header: k, key: k, width: 16 }))
-            data.forEach((obj) => ws.addRow(obj))
+            // 对象数组：自动列（首行即表头）
+            headerRowCount = 1
+            ws.columns = Object.keys(data[0]).map((k) => ({ header: k, key: k }))
+            data.forEach((obj) => {
+              const row = {}
+              for (const [k, v] of Object.entries(obj)) row[k] = toCellValue(v)
+              ws.addRow(row)
+            })
           } else {
-            ws.addRow(data)
+            ws.addRow(data.map(toCellValue))
           }
         }
-        // 自动列宽（简单估算）
-        ws.columns.forEach((col) => {
-          if (col.width == null) col.width = 16
-        })
+        // 自动列宽（CJK 友好估算：中文/全角按 2 计）
+        if (autoW && Array.isArray(data) && data.length) {
+          const colCount = Math.max(1, ...data.map((r) => (Array.isArray(r) ? r.length : 1)))
+          const keys = headerRowCount && typeof data[0] === 'object' && !Array.isArray(data[0]) ? Object.keys(data[0]) : null
+          for (let ci = 0; ci < colCount; ci++) {
+            let max = 8
+            for (const row of data) {
+              const v = Array.isArray(row) ? row[ci] : (keys ? row[keys[ci]] : undefined)
+              if (v == null) continue
+              const w = [...String(v)].reduce((a, c) => a + (c.charCodeAt(0) > 255 ? 2 : 1), 0)
+              if (w > max) max = w
+            }
+            ws.getColumn(ci + 1).width = Math.min(60, max + 2)
+          }
+        }
+        // 冻结首行（有表头时）
+        if (freeze && headerRowCount > 0) {
+          ws.views = [{ state: 'frozen', ySplit: headerRowCount }]
+        }
       }
 
       await wb.xlsx.writeFile(target)

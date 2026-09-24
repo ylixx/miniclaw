@@ -97,6 +97,19 @@ function renderTable(slide, matrix, theme) {
   })
 }
 
+// ── 规范化图片参数（4B 可能传字符串路径，或 { path } / { data: base64, type }）──
+function normalizeImage(img) {
+  if (!img) return null
+  if (typeof img === 'string') return { path: img }
+  if (img.path) return { path: img.path }
+  if (img.data != null) {
+    const data = String(img.data).replace(/^data:image\/[a-zA-Z]+;base64,/, '')
+    const type = (img.type || 'png').replace(/^image\//, '').toUpperCase()
+    return { data, type }
+  }
+  return null
+}
+
 export function registerPptxOps(registry, { getBaseDir } = {}) {
   const getCtx = () => {
     const bd = getBaseDir()
@@ -116,7 +129,7 @@ export function registerPptxOps(registry, { getBaseDir } = {}) {
         themeColor: { type: 'string', description: '主题色十六进制，如 "2563EB"，默认 1F4E79 深蓝' },
         slides: {
           type: 'array',
-          description: '幻灯片数组。每页: { title, layout?, bullets?, content?, table?, notes? }。layout 可选 titleAndBullets(默认)/titleOnly/titleAndContent/section/blank/table。bullets 为要点(字符串或数组)；content 为正文段落(字符串或数组)；table 为表格数据——二维数组(首行作表头加粗)或对象数组(键作列)，也可用 rows/data 命名；notes 为演讲者备注。',
+          description: '幻灯片数组。每页: { title, layout?, bullets?, content?, table?, image?, notes? }。layout 可选 titleAndBullets(默认)/titleOnly/titleAndContent/section/blank/table。bullets 为要点(字符串或数组)；content 为正文段落(字符串或数组)；table 为表格数据——二维数组(首行作表头加粗)或对象数组(键作列)，也可用 rows/data 命名；image 为图片(图文页)：工作区内图片路径字符串，或 { path } / { data: base64, type: "png" }，与 bullets/content 二选一更清晰；notes 为演讲者备注。',
           items: { type: 'object' },
         },
       },
@@ -176,6 +189,21 @@ export function registerPptxOps(registry, { getBaseDir } = {}) {
             align: layout === 'section' ? 'center' : 'left',
             valign: 'middle',
           })
+        }
+        // 图片页（图文）：有 image 字段则渲染图片并跳过正文，标题仍保留
+        const img = normalizeImage(s.image)
+        if (img) {
+          try {
+            const opt = { x: 0.5, y: s.title ? 1.6 : 0.8, w: 8.0, h: 4.5 }
+            if (img.path) opt.path = guard.resolve(img.path)
+            else { opt.data = 'image/' + (img.type || 'png').toLowerCase() + ';base64,' + img.data }
+            slide.addImage(opt)
+          } catch (e) {
+            warnings.push(`slide「${s.title || '(无标题)'}」图片渲染失败：${e.message}`)
+          }
+          if (s.notes) slide.addNotes(Array.isArray(s.notes) ? s.notes.join('\n') : String(s.notes))
+          slideList.push(slide)
+          continue
         }
         if (layout === 'titleOnly' || layout === 'blank') {
           // 仅标题/空白，不自动加正文

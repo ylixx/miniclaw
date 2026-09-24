@@ -52,6 +52,39 @@ function encodeXml(s) {
     .replace(/'/g, '&apos;')
 }
 
+// ── 行内格式解析（**粗** / *斜* / _斜_ / `代码`）→ TextRun 序列 ──
+// 4B 写 Markdown 很自然，但创建时若不解析行内标记，粗体/斜体就丢了。
+function parseInline(text) {
+  const s = String(text ?? '')
+  const runs = []
+  const re = /(\*\*([^*]+)\*\*|__([^_]+)__|\*([^*\n]+)\*|_([^_\n]+)_|`([^`]+)`)/g
+  let last = 0
+  let m
+  while ((m = re.exec(s)) !== null) {
+    if (m.index > last) runs.push({ text: s.slice(last, m.index) })
+    if (m[2] != null) runs.push({ text: m[2], bold: true })
+    else if (m[3] != null) runs.push({ text: m[3], bold: true })
+    else if (m[4] != null) runs.push({ text: m[4], italics: true })
+    else if (m[5] != null) runs.push({ text: m[5], italics: true })
+    else if (m[6] != null) runs.push({ text: m[6], bold: true }) // 代码：用粗体近似（docx 等宽字体可后续加）
+    last = re.lastIndex
+  }
+  if (last < s.length) runs.push({ text: s.slice(last) })
+  return runs.length ? runs : [{ text: s }]
+}
+
+// ── 图片数据加载：path（工作区内，走 PathGuard）或 base64（可带 data: 前缀）──
+async function loadImageData(guard, path, data) {
+  if (data != null) {
+    return String(data).replace(/^data:image\/[a-zA-Z]+;base64,/, '')
+  }
+  if (path != null) {
+    const p = await guard.resolveChecked(String(path), { allowDir: false })
+    return await fs.readFile(p)
+  }
+  return null
+}
+
 // ── 轻量 Markdown → blocks ───────────────────────────────────
 // 4B 模型填不对嵌套的 blocks 对象数组（实测：它会退化成反复用 write_file 写纯文本，
 // 产出打不开的伪 docx），但它很擅长写 Markdown。所以允许直接喂 Markdown 文本
@@ -60,9 +93,10 @@ function markdownToBlocks(md) {
   const lines = String(md || '').split(/\r?\n/)
   const blocks = []
   let list = null
+  let listType = null
   let table = null
   const flush = () => {
-    if (list) { blocks.push({ type: 'bullets', items: list }); list = null }
+    if (list) { blocks.push({ type: listType, items: list }); list = null; listType = null }
     if (table) { blocks.push({ type: 'table', rows: table }); table = null }
   }
   for (const raw of lines) {
@@ -80,7 +114,13 @@ function markdownToBlocks(md) {
       table.push(cells)
       continue
     }
-    if (li || num) { flush(); if (!list) list = []; list.push((li ? li[1] : num[1]).trim()); continue }
+    if (li || num) {
+      const type = num ? 'numbered' : 'bullets'
+      if (list && listType !== type) flush()  // 符号/编号混排时另起一个列表
+      if (!list) { list = []; listType = type }
+      list.push((li ? li[1] : num[1]).trim())
+      continue
+    }
     flush()
     if (!line) continue
     blocks.push({ type: 'paragraph', text: line })
@@ -109,7 +149,7 @@ export function registerDocxOps(registry, { getBaseDir } = {}) {
         from_md: { type: 'string', description: '推荐：已存在的 .md 文件路径，自动转 docx（与 markdown 二选一）' },
         blocks: {
           type: 'array',
-          description: '结构化内容块数组（markdown/from_md 更简单，优先用它们）。每块: {type, ...}。type 可选 heading(需 text,level 1-6)/paragraph(需 text)/bullets(需 items 字符串数组)/table(需 rows 二维字符串数组，首行作表头)。',
+          description: '结构化内容块数组（markdown/from_md 更简单，优先用它们）。每块: {type, ...}。type 可选 heading(需 text,level 1-6)/paragraph(需 text，支持 **粗** *斜* `代码` 行内格式)/bullets(需 items 字符串数组)/numbered(编号列表，需 items)/table(需 rows 二维数组，首行作表头)/pagebreak(分页符)/image(需 path 工作区内图片路径 或 data: base64 字符串，可选 width/height 像素)。',
           items: { type: 'object' },
         },
       },
@@ -119,6 +159,7 @@ export function registerDocxOps(registry, { getBaseDir } = {}) {
       const { docx } = await ensureLibs()
       const {
         Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, Table, TableRow, TableCell, WidthType, BorderStyle,
+        PageBreak, NumberFormat, ImageRun,
       } = docx
       const { guard, rel } = getCtx()
       const target = guard.resolve(filePath)
@@ -138,6 +179,14 @@ export function registerDocxOps(registry, { getBaseDir } = {}) {
 
       const headingLevels = [HeadingLevel.TITLE, HeadingLevel.HEADING_1, HeadingLevel.HEADING_2, HeadingLevel.HEADING_3, HeadingLevel.HEADING_4, HeadingLevel.HEADING_5, HeadingLevel.HEADING_6]
 
+      // 文档级编号配置（供编号列表使用）；Document 的 numbering 选项接收配置对象，内部自行实例化
+      const numberingConfig = {
+        config: [{
+          reference: 'miniagent-num',
+          levels: [{ level: 0, format: NumberFormat.DECIMAL, text: '%1.', alignment: AlignmentType.START, style: { paragraph: { indent: { left: 720, hanging: 360 } } } }],
+        }],
+      }
+
       const children = []
       if (title) {
         children.push(new Paragraph({ text: title, heading: HeadingLevel.TITLE, alignment: AlignmentType.CENTER }))
@@ -147,10 +196,13 @@ export function registerDocxOps(registry, { getBaseDir } = {}) {
         if (t === 'heading') {
           const lvl = Math.min(6, Math.max(1, Number(b.level) || 1))
           children.push(new Paragraph({ text: String(b.text || ''), heading: headingLevels[lvl] }))
-        } else if (t === 'bullets') {
+        } else if (t === 'bullets' || t === 'numbered') {
           const items = Array.isArray(b.items) ? b.items : (b.items ? [b.items] : [])
           for (const it of items) {
-            children.push(new Paragraph({ text: String(it), bullet: { level: 0 } }))
+            const opts = { children: parseInline(it).map((r) => new TextRun({ text: String(r.text ?? ''), bold: !!r.bold, italics: !!r.italics })) }
+            if (t === 'numbered') opts.numbering = { reference: 'miniagent-num', level: 0 }
+            else opts.bullet = { level: 0 }
+            children.push(new Paragraph(opts))
           }
         } else if (t === 'table') {
           const rows = Array.isArray(b.rows) ? b.rows : (Array.isArray(b.data) ? b.data : (Array.isArray(b.table) ? b.table : []))
@@ -160,7 +212,7 @@ export function registerDocxOps(registry, { getBaseDir } = {}) {
                 tableHeader: ri === 0,
                 children: (Array.isArray(row) ? row : [row]).map((cell) =>
                   new TableCell({
-                    children: [new Paragraph({ children: [new TextRun({ text: String(cell ?? ''), bold: ri === 0 })] })],
+                    children: [new Paragraph({ children: parseInline(cell).map((r) => new TextRun({ text: String(r.text ?? ''), bold: ri === 0 ? true : !!r.bold, italics: !!r.italics })) })],
                   })
                 ),
               })
@@ -171,15 +223,25 @@ export function registerDocxOps(registry, { getBaseDir } = {}) {
               rows: tableRows,
             }))
           }
+        } else if (t === 'pagebreak') {
+          children.push(new Paragraph({ children: [new PageBreak()] }))
+        } else if (t === 'image') {
+          const imgData = await loadImageData(guard, b.path, b.data)
+          if (imgData != null) {
+            const w = Number(b.width) || 480
+            const h = Number(b.height) || 320
+            children.push(new Paragraph({ children: [new ImageRun({ data: imgData, transformation: { width: w, height: h } })] }))
+          }
         } else {
           // paragraph（默认）
-          children.push(new Paragraph({ children: [new TextRun(String(b.text || ''))] }))
+          children.push(new Paragraph({ children: parseInline(b.text).map((r) => new TextRun({ text: String(r.text ?? ''), bold: !!r.bold, italics: !!r.italics })) }))
         }
       }
 
       const doc = new Document({
         creator: author || 'MiniAgent',
         title: title || '',
+        numbering: numberingConfig,
         sections: [{ children }],
       })
       const buffer = await Packer.toBuffer(doc)
