@@ -153,7 +153,7 @@ export function registerDocxOps(registry, { getBaseDir } = {}) {
             children.push(new Paragraph({ text: String(it), bullet: { level: 0 } }))
           }
         } else if (t === 'table') {
-          const rows = Array.isArray(b.rows) ? b.rows : []
+          const rows = Array.isArray(b.rows) ? b.rows : (Array.isArray(b.data) ? b.data : (Array.isArray(b.table) ? b.table : []))
           if (rows.length) {
             const tableRows = rows.map((row, ri) =>
               new TableRow({

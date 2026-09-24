@@ -61,6 +61,42 @@ function extractTextRuns(xml) {
   return runs
 }
 
+// ── 规范化表格数据（4B 可能用 table/rows/data 任一命名，或传对象数组，或字符串化）──
+function normalizeTable(data) {
+  if (!data) return null
+  if (typeof data === 'string') {
+    try { data = JSON.parse(data) } catch { return null }
+  }
+  if (!Array.isArray(data) || data.length === 0) return null
+  // 对象数组 → 矩阵（键作表头行）
+  if (data[0] && typeof data[0] === 'object' && !Array.isArray(data[0])) {
+    const keys = Object.keys(data[0])
+    return [keys, ...data.map((obj) => keys.map((k) => (obj == null ? '' : obj[k])))]
+  }
+  // 已是二维数组 → 直接返回（每行确保为数组）
+  return data.map((row) => (Array.isArray(row) ? row : [row]))
+}
+
+// ── 渲染表格到幻灯片（首行作表头：主题色填充 + 白字加粗）────────────────
+function renderTable(slide, matrix, theme) {
+  const headerFill = theme || '1F4E79'
+  const rows = matrix.map((row, ri) =>
+    (Array.isArray(row) ? row : [row]).map((cell) => {
+      const text = cell == null ? '' : String(cell)
+      if (ri === 0) {
+        return { text, options: { bold: true, color: 'FFFFFF', fill: { color: headerFill }, align: 'center' } }
+      }
+      return { text, options: { align: 'left' } }
+    })
+  )
+  slide.addTable(rows, {
+    x: 0.5, y: 1.5, w: 9.0,
+    fontSize: 14, color: '222222',
+    border: { type: 'solid', color: 'BBBBBB', pt: 1 },
+    valign: 'middle', autoPage: false,
+  })
+}
+
 export function registerPptxOps(registry, { getBaseDir } = {}) {
   const getCtx = () => {
     const bd = getBaseDir()
@@ -70,7 +106,7 @@ export function registerPptxOps(registry, { getBaseDir } = {}) {
   // ── 生成 PPTX ────────────────────────────────────────────────
   registry.register({
     name: 'create_pptx',
-    description: '根据结构化大纲生成 PowerPoint(.pptx) 演示文稿。支持封面页、要点列表、正文段落、章节页与备注，可选主题色。文件落在当前任务工作区。',
+    description: '根据结构化大纲生成 PowerPoint(.pptx) 演示文稿。支持封面页、要点列表、正文段落、章节页、表格页与备注，可选主题色。文件落在当前任务工作区。示例：create_pptx({"path":"a.pptx","title":"汇报","slides":[{"title":"数据","layout":"table","table":[["姓名","分数"],["张三","90"],["李四","85"]]},{"title":"结论","bullets":["达标","可推广"]}]})',
     parameters: {
       type: 'object',
       properties: {
@@ -80,7 +116,7 @@ export function registerPptxOps(registry, { getBaseDir } = {}) {
         themeColor: { type: 'string', description: '主题色十六进制，如 "2563EB"，默认 1F4E79 深蓝' },
         slides: {
           type: 'array',
-          description: '幻灯片数组。每页: { title, layout?, bullets?, content?, notes? }。layout 可选 titleAndBullets(默认)/titleOnly/titleAndContent/section/blank。bullets 为要点字符串数组；content 为正文段落(字符串或数组)；notes 为演讲者备注。',
+          description: '幻灯片数组。每页: { title, layout?, bullets?, content?, table?, notes? }。layout 可选 titleAndBullets(默认)/titleOnly/titleAndContent/section/blank/table。bullets 为要点(字符串或数组)；content 为正文段落(字符串或数组)；table 为表格数据——二维数组(首行作表头加粗)或对象数组(键作列)，也可用 rows/data 命名；notes 为演讲者备注。',
           items: { type: 'object' },
         },
       },
@@ -124,9 +160,14 @@ export function registerPptxOps(registry, { getBaseDir } = {}) {
         slideList.push(cover)
       }
 
+      const warnings = []
+      const KNOWN_LAYOUTS = ['titleAndBullets', 'titleOnly', 'titleAndContent', 'section', 'blank', 'table']
       for (const s of slides) {
         const slide = pptx.addSlide()
         const layout = s.layout || 'titleAndBullets'
+        if (!KNOWN_LAYOUTS.includes(layout)) {
+          warnings.push(`未知 layout:「${layout}」，已按默认 titleAndBullets 处理`)
+        }
         if (s.title) {
           slide.addText(s.title, {
             x: 0.5, y: 0.3, w: 9.0, h: 1.0,
@@ -155,8 +196,29 @@ export function registerPptxOps(registry, { getBaseDir } = {}) {
               paraSpaceAfter: 8, lineSpacingMultiple: 1.1,
             })
           }
+        } else if (layout === 'table') {
+          const matrix = normalizeTable(s.table ?? s.rows ?? s.data)
+          if (matrix && matrix.length) {
+            renderTable(slide, matrix, theme)
+          } else if (Array.isArray(s.bullets) ? s.bullets.length : (s.bullets || s.content)) {
+            warnings.push(`slide「${s.title || '(无标题)'}」layout=table 但未提供表格数据，已退化为要点/正文`)
+            const bullets = Array.isArray(s.bullets) ? s.bullets : (s.bullets ? [s.bullets] : [])
+            if (bullets.length) {
+              slide.addText(bullets.map((b) => ({ text: String(b) })), {
+                x: 0.6, y: 1.5, w: 8.8, h: 3.6, fontSize: 16, color: '222222',
+                valign: 'top', bullet: { code: '2022', indent: 18 }, paraSpaceAfter: 6,
+              })
+            } else if (s.content) {
+              const body = Array.isArray(s.content) ? s.content : [s.content]
+              slide.addText(body.map((b) => ({ text: String(b) })), {
+                x: 0.6, y: 1.5, w: 8.8, h: 3.6, fontSize: 16, color: '222222', valign: 'top', paraSpaceAfter: 8,
+              })
+            }
+          } else {
+            warnings.push(`slide「${s.title || '(无标题)'}」layout=table 但未提供任何内容`)
+          }
         } else {
-          // titleAndBullets（默认）
+          // titleAndBullets（默认，也兜底未知 layout）
           const bullets = Array.isArray(s.bullets) ? s.bullets : (s.bullets ? [s.bullets] : [])
           if (bullets.length) {
             slide.addText(bullets.map((b) => ({ text: String(b) })), {
@@ -182,6 +244,7 @@ export function registerPptxOps(registry, { getBaseDir } = {}) {
         path: rel(target),
         slideCount: slideList.length,
         note: title ? '已生成封面页 + ' + slides.length + ' 内容页' : '已生成 ' + slides.length + ' 页',
+        ...(warnings.length ? { warnings } : {}),
       }
     },
   })

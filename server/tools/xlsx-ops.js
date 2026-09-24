@@ -36,7 +36,7 @@ export function registerXlsxOps(registry, { getBaseDir } = {}) {
         path: { type: 'string', description: '输出 .xlsx 文件路径（工作区内，须以 .xlsx 结尾）' },
         sheets: {
           type: 'array',
-          description: '工作表数组。每项: { name?, data }。data 为二维数组（首行作表头加粗）或对象数组（键作表头）。可只传一个 sheet。',
+          description: '工作表数组。每项: { name?, data }。data 为二维数组（首行作表头加粗）或对象数组（键作列）；也可用 rows/table/content 命名。可只传一个 sheet。',
           items: { type: 'object' },
         },
         creator: { type: 'string', description: '作者署名，写入文档属性，可选' },
@@ -62,7 +62,9 @@ export function registerXlsxOps(registry, { getBaseDir } = {}) {
       for (const sh of sheets) {
         const name = sh.name || `Sheet${sheets.indexOf(sh) + 1}`
         const ws = wb.addWorksheet(name.slice(0, 31))
-        const data = sh.data
+        // 4B 可能用 data/rows/table/content 任一命名；也可能是字符串化数组，在此归一化
+        let data = sh.data ?? sh.rows ?? sh.table ?? sh.content
+        if (typeof data === 'string') { try { data = JSON.parse(data) } catch {} }
         if (Array.isArray(data) && data.length) {
           if (Array.isArray(data[0])) {
             // 二维数组：首行加粗表头
