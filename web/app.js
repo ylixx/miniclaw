@@ -941,7 +941,9 @@ function appendImageToChat(dataUrl) {
 function appendToolCall(name, args) {
   const wrap = document.createElement('div')
   wrap.className = 'message tool-call'
-  const argsStr = (args && Object.keys(args).length) ? JSON.stringify(args) : '（无参数）'
+  const argsStr = (args && typeof args === 'object' && !Array.isArray(args) && Object.keys(args).length)
+    ? formatToolValue(args)
+    : '（无参数）'
   wrap.innerHTML = `
     <div class="tool-call-head">
       <span class="tool-icon">🔧</span>
@@ -957,15 +959,17 @@ function appendToolCall(name, args) {
 function appendToolResult(name, result) {
   const wrap = document.createElement('div')
   wrap.className = 'message tool-result'
-  const text = typeof result === 'string' ? result : JSON.stringify(result)
-  const isErr = !!(result && result.error) || /"error"/.test(text) || text.startsWith('错误')
+  const display = formatToolValue(result)
+  const parsed = typeof result === 'string' ? tryParseJSON(result) : result
+  const isErr = !!(parsed && typeof parsed === 'object' && parsed.error) ||
+                (typeof result === 'string' && (/"error"/.test(result) || result.startsWith('错误')))
   wrap.innerHTML = `
     <div class="tool-call-head">
       <span class="tool-icon">${isErr ? '⚠️' : '✅'}</span>
       <span class="tool-name">${escapeHtml(name)}</span>
       <span class="tool-state ${isErr ? 'error' : 'success'}">${isErr ? '失败' : '完成'}</span>
     </div>
-    <div class="tool-args"><code>${escapeHtml(text).slice(0, 400)}</code></div>`
+    <div class="tool-args"><code>${escapeHtml(display).slice(0, 600)}</code></div>`
   chatMessages.appendChild(wrap)
   chatMessages.scrollTop = chatMessages.scrollHeight
   addLogEntry(name, isErr ? 'error' : 'success')
@@ -1005,6 +1009,71 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;')
+}
+
+// ── 工具结果/参数：把"原始 JSON"转为可读正常数据（界面不再出现 JSON 大括号） ──
+// 尝试把字符串解析成对象/数组；解析失败（或本就不是 JSON）返回 undefined
+function tryParseJSON(str) {
+  if (typeof str !== 'string') return undefined
+  const s = str.trim()
+  if (s !== '' && (s[0] === '{' || s[0] === '[')) {
+    try { return JSON.parse(s) } catch { return undefined }
+  }
+  return undefined
+}
+
+// 字段名人类可读化：snake_case / camelCase → 空格分词并首字母大写
+function humanizeKey(k) {
+  return String(k)
+    .replace(/_/g, ' ')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/^./, c => c.toUpperCase())
+}
+
+// 单值展示（基本类型直接出，嵌套对象/数组递归，不再丢 JSON 大括号）
+function formatScalar(v) {
+  if (v === null || v === undefined) return '—'
+  if (typeof v === 'boolean') return v ? '是' : '否'
+  if (typeof v === 'number' || typeof v === 'bigint') return String(v)
+  if (typeof v === 'string') return v
+  if (Array.isArray(v)) return v.length ? v.map(formatScalar).join('、') : '（空）'
+  if (typeof v === 'object') return formatObject(v)
+  return String(v)
+}
+
+// 对象展示：错误优先；读类工具直接出正文；其余剔除状态字段后做"标签：值"逐行展示
+function formatObject(obj) {
+  if (obj == null) return '—'
+  if (typeof obj.error === 'string') {
+    let s = '❌ 错误：' + obj.error
+    if (obj.code) s += `（${obj.code}）`
+    return s
+  }
+  if (typeof obj.content === 'string' && obj.content.trim()) return obj.content
+  const skip = new Set(['success', 'isError', 'error'])
+  const keys = Object.keys(obj).filter(k => !skip.has(k))
+  if (keys.length === 0) return obj.success === false ? '（失败）' : '✅ 成功'
+  return keys.map(k => `${humanizeKey(k)}：${formatScalar(obj[k])}`).join('\n')
+}
+
+function formatAny(v) {
+  if (v == null) return '（无返回）'
+  if (Array.isArray(v)) {
+    if (!v.length) return '（空列表）'
+    return v.map(it => `· ${formatScalar(it)}`).join('\n')
+  }
+  if (typeof v === 'object') return formatObject(v)
+  return formatScalar(v)
+}
+
+// 统一入口：字符串（可能是 JSON）与对象都可处理
+function formatToolValue(v) {
+  if (typeof v === 'string') {
+    const parsed = tryParseJSON(v)
+    if (parsed !== undefined) return formatAny(parsed)
+    return v
+  }
+  return formatAny(v)
 }
 
 // ── Markdown 渲染（对话框格式美化，离线无依赖）─────────────

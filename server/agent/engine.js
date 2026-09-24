@@ -654,7 +654,23 @@ function parseNativeToolCalls(toolCalls) {
     if (!fn || !fn.name) continue
     let args = fn.arguments
     if (typeof args === 'string') {
-      try { args = JSON.parse(args || '{}') } catch { args = {} }
+      const raw = (args || '').trim()
+      if (raw === '') {
+        args = {}
+      } else {
+        try {
+          args = JSON.parse(raw)
+        } catch {
+          // 关键修复：不再把"参数 JSON 解析失败"静默替成 {}。
+          // 否则下游校验器会报出误导性的"xxx 必须是非空数组"，
+          // 且所有截断尝试会塌缩成同一失败签名，误触发"禁止重试"。
+          // 改为显式返回 error，走已有的格式纠错回环，让模型重新完整生成。
+          return {
+            type: 'error',
+            error: `工具「${fn.name}」的 arguments 不是合法 JSON（模型输出可能被截断或格式损坏），无法解析。原始片段：${raw.slice(0, 200)}`,
+          }
+        }
+      }
     }
     return {
       type: 'tool_call',

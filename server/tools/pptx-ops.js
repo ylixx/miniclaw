@@ -88,6 +88,11 @@ export function registerPptxOps(registry, { getBaseDir } = {}) {
     },
     async execute({ path: filePath, title, author, themeColor, slides }) {
       const { PptxGenJS } = await ensureLibs()
+      // 容错归一化：4B 模型有时会把 slides 包成 JSON 字符串（双重转义）而非数组，
+      // 在此尝试还原，避免直接抛出"必须是非空数组"误导模型。
+      if (typeof slides === 'string') {
+        try { slides = JSON.parse(slides) } catch { /* 还原失败则交由下方校验抛错 */ }
+      }
       if (!Array.isArray(slides) || slides.length === 0) throw new Error('slides 必须是非空数组')
       const { guard, rel } = getCtx()
       const target = guard.resolve(filePath)
